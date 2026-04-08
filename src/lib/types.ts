@@ -12,6 +12,14 @@ export const DEFAULT_HEADERS = [
 ] as const;
 
 export type TransactionType = "income" | "expense";
+export type AppErrorStep =
+  | "env"
+  | "jwt"
+  | "google-token"
+  | "sheet-read"
+  | "sheet-write"
+  | "sheet-delete"
+  | "parse";
 
 export interface AssetFetcher {
   fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
@@ -80,4 +88,27 @@ export interface GoogleSpreadsheetResponse {
 export interface SheetSnapshot {
   headers: string[];
   rows: string[][];
+}
+
+export interface DebugSheetsResult {
+  spreadsheetId: string;
+  sheetName: string;
+  expectedHeaders: readonly string[];
+  detectedHeaders: string[];
+  rowCount: number;
+  firstRecord: TransactionRecord | null;
+}
+
+export class AppError extends Error {
+  readonly step: AppErrorStep;
+  readonly details?: string;
+  readonly status: number;
+
+  constructor(step: AppErrorStep, message: string, details?: string, status = 500) {
+    super(message);
+    this.name = "AppError";
+    this.step = step;
+    this.details = details;
+    this.status = status;
+  }
 }

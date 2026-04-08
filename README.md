@@ -155,6 +155,7 @@ Si desplegás por GitHub Actions, el workflow sube `PRIVATE_KEY` y pasa `SPREADS
 - `POST /api/transactions`
 - `PATCH /api/transactions`
 - `DELETE /api/transactions/:id`
+- `GET /debug/sheets` temporal para diagnostico
 
 ## Contrato de datos
 

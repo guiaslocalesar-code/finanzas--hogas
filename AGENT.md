@@ -34,6 +34,7 @@ Este repositorio contiene una app de finanzas personales migrada desde Google Ap
 - `POST /api/transactions` crea una transacción
 - `PATCH /api/transactions` actualiza una transacción por `id`
 - `DELETE /api/transactions/:id` elimina una transacción por `id`
+- `GET /debug/sheets` se puede usar temporalmente para diagnostico de Google Sheets
 
 ## Formato de datos
 Headers esperados del Google Sheet:

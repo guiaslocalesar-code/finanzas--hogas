@@ -1,16 +1,19 @@
 import { Hono } from "hono";
 import {
   createTransaction,
+  debugSheets,
   deleteTransaction,
   listTransactions,
   updateTransaction
 } from "./lib/sheets";
 import type {
+  AppErrorStep,
   CreateTransactionInput,
   Env,
   TransactionType,
   UpdateTransactionInput
 } from "./lib/types";
+import { AppError, DEFAULT_HEADERS, SHEET_NAME } from "./lib/types";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -23,8 +26,21 @@ app.get("/health", (c) => {
 });
 
 app.get("/api/transactions", async (c) => {
-  const transactions = await listTransactions(c.env);
-  return c.json(transactions);
+  try {
+    const transactions = await listTransactions(c.env);
+    return c.json(transactions);
+  } catch (error) {
+    const appError = toAppError(error, "sheet-read");
+    return c.json(
+      {
+        ok: false,
+        step: appError.step,
+        error: appError.message,
+        details: appError.details ?? null
+      },
+      { status: appError.status as 500 }
+    );
+  }
 });
 
 app.post("/api/transactions", async (c) => {
@@ -87,6 +103,33 @@ app.delete("/api/transactions/:id", async (c) => {
   return c.json({ ok: true, id });
 });
 
+app.get("/debug/sheets", async (c) => {
+  try {
+    const result = await debugSheets(c.env);
+    return c.json({
+      ok: true,
+      ...result
+    });
+  } catch (error) {
+    const appError = toAppError(error, "sheet-read");
+    return c.json(
+      {
+        ok: false,
+        spreadsheetId: c.env.SPREADSHEET_ID ?? "",
+        sheetName: SHEET_NAME,
+        expectedHeaders: DEFAULT_HEADERS,
+        detectedHeaders: [],
+        rowCount: 0,
+        firstRecord: null,
+        step: appError.step,
+        error: appError.message,
+        details: appError.details ?? null
+      },
+      { status: appError.status as 500 }
+    );
+  }
+});
+
 app.notFound(async (c) => {
   if (c.req.method === "GET" && !c.req.path.startsWith("/api/")) {
     return c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
@@ -97,7 +140,16 @@ app.notFound(async (c) => {
 
 app.onError((error, c) => {
   console.error(error);
-  return c.json({ error: "Internal server error." }, 500);
+  const appError = toAppError(error, "parse");
+  return c.json(
+    {
+      ok: false,
+      step: appError.step,
+      error: appError.message,
+      details: appError.details ?? null
+    },
+    { status: appError.status as 500 }
+  );
 });
 
 export default app;
@@ -199,4 +251,16 @@ function stringField(value: unknown): string {
 
 function dateField(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function toAppError(error: unknown, fallbackStep: AppErrorStep): AppError {
+  if (error instanceof AppError) {
+    return error;
+  }
+
+  return new AppError(
+    fallbackStep,
+    error instanceof Error ? error.message : "Internal server error.",
+    error instanceof Error ? error.stack : String(error)
+  );
 }
