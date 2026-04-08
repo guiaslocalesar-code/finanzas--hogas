@@ -1,0 +1,9 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
+name = "afinanzas-hogar-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-08"
+
+[assets]
+directory = "./src/static"
+binding = "ASSETS"
+run_worker_first = true
