@@ -132,7 +132,7 @@ export async function debugSheets(env: Env): Promise<DebugSheetsResult> {
   const transactions = await listTransactions(env);
 
   return {
-    spreadsheetId: env.SPREADSHEET_ID,
+    spreadsheetId: getSanitizedSpreadsheetId(env),
     sheetName: SHEET_NAME,
     expectedHeaders: DEFAULT_HEADERS,
     detectedHeaders: snapshot.headers,
@@ -300,7 +300,8 @@ async function sheetsRequest(
   init?: RequestInit
 ): Promise<Response> {
   const accessToken = await getGoogleAccessToken(env);
-  const url = `${GOOGLE_SHEETS_API}/${env.SPREADSHEET_ID}${path}`;
+  const spreadsheetId = getSanitizedSpreadsheetId(env);
+  const url = `${GOOGLE_SHEETS_API}/${spreadsheetId}${path}`;
 
   console.log("[sheets] Requesting Google Sheets API", {
     step,
@@ -414,4 +415,8 @@ function columnNumberToLetter(columnNumber: number): string {
   }
 
   return letter || "A";
+}
+
+function getSanitizedSpreadsheetId(env: Env): string {
+  return env.SPREADSHEET_ID.trim().replace(/\/+$/, "");
 }
