@@ -109,6 +109,7 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
   const amountAnalysis = detectVisaSantanderAmounts(text);
   const totalAmount = amountAnalysis.totalAmount.value;
   const minimumPayment = amountAnalysis.minimumPayment.value;
+  const totalAmountUSD = detectStatementUsdTotal(text);
   const projectionAnalysis = parseBnaStyleProjections(text);
   const projections = projectionAnalysis.projections;
   const installmentAnalysis = parseVisaInstallmentDetail(text);
@@ -134,14 +135,18 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
     dueDate,
     nextDueDate,
     totalAmount,
+    totalAmountARS: totalAmount,
+    totalAmountUSD,
     minimumPayment,
+    minimumPaymentARS: minimumPayment,
+    minimumPaymentUSD: 0,
     projections,
     installmentsDetail: installmentAnalysis.installments,
     rawDetectedData: buildParserDebug(
       "parseVisaSantanderStatement",
       text,
       warnings,
-      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, totalAmountUSD, minimumPayment },
       projections,
       projectionAnalysis.candidateBlocks,
       {
@@ -169,6 +174,7 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
   const nextDueDate = detectDate(text, [/PROXIMO VTO\.?\s*([^\n]+)/i], warnings, "nextDueDate");
   const totalAmount = detectAmount(text, [/SALDO ACTUAL:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
   const minimumPayment = detectAmount(text, [/PAGO M.{0,4}NIMO:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
+  const totalAmountUSD = detectStatementUsdTotal(text);
   const projectionAnalysis = parseBnaStyleProjections(text);
   const projections = projectionAnalysis.projections;
   const installmentAnalysis = parseVisaBnaInstallmentDetail(text);
@@ -186,14 +192,18 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
     dueDate,
     nextDueDate,
     totalAmount,
+    totalAmountARS: totalAmount,
+    totalAmountUSD,
     minimumPayment,
+    minimumPaymentARS: minimumPayment,
+    minimumPaymentUSD: 0,
     projections,
     installmentsDetail: installmentAnalysis.installments,
     rawDetectedData: buildParserDebug(
       "parseVisaBnaStatement",
       text,
       warnings,
-      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, totalAmountUSD, minimumPayment },
       projections,
       projectionAnalysis.candidateBlocks,
       {
@@ -222,6 +232,7 @@ export function parseMastercardBnaStatement(text: string): ParsedCardStatementPr
   const nextDueDate = detectDate(text, [/Pr[\s\S]{0,12}?ximo Vencimiento:\s*([^\n]+)/i], warnings, "nextDueDate");
   const totalAmount = detectAmount(text, [/Saldo actual:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
   const minimumPayment = detectAmount(text, [/Pago[\s\S]{0,16}?nimo:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
+  const totalAmountUSD = detectStatementUsdTotal(text);
   const projectionAnalysis = parseMastercardBnaProjections(text, dueDate);
   const projections = projectionAnalysis.projections;
   const installmentAnalysis = parseMastercardInstallmentDetail(text);
@@ -239,14 +250,18 @@ export function parseMastercardBnaStatement(text: string): ParsedCardStatementPr
     dueDate,
     nextDueDate,
     totalAmount,
+    totalAmountARS: totalAmount,
+    totalAmountUSD,
     minimumPayment,
+    minimumPaymentARS: minimumPayment,
+    minimumPaymentUSD: 0,
     projections,
     installmentsDetail: installmentAnalysis.installments,
     rawDetectedData: buildParserDebug(
       "parseMastercardBnaStatement",
       text,
       warnings,
-      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, totalAmountUSD, minimumPayment },
       projections,
       projectionAnalysis.candidateBlocks,
       {
@@ -1008,6 +1023,24 @@ function selectAmountDetection(candidates: AmountDetectionCandidate[]): AmountDe
     matchedRule: selected?.rule ?? "",
     candidates
   };
+}
+
+function detectStatementUsdTotal(text: string): number {
+  const patterns = [
+    /SALDO\s+ACTUAL[\s\S]{0,420}?(?:U\$S|USD|D[OÓ]LARES?)[^\d-]*([\d\.\,]+)/i,
+    /TOTAL(?:\s+A\s+PAGAR)?[\s\S]{0,120}?(?:U\$S|USD|D[OÓ]LARES?)[^\d-]*([\d\.\,]+)/i,
+    /(?:U\$S|USD)\s*([\d\.\,]+)\s*(?:SALDO|TOTAL)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const parsed = parseAmount(match?.[1] ?? "");
+    if (parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return 0;
 }
 
 function parseBnaStyleProjections(text: string): {
