@@ -1095,6 +1095,29 @@ function parseVisaBnaInstallmentDetail(text: string): InstallmentDetailAnalysis 
 function parseMastercardInstallmentDetail(text: string): InstallmentDetailAnalysis {
   const installments: ParsedCardStatementPreview["installmentsDetail"] = [];
   const candidateLines: string[] = [];
+  const multilinePattern =
+    /(?:^|\n)\s*\d{1,2}[-\/][A-Za-zÁÉÍÓÚáéíóúñÑ]{3,4}\.?(?:[-\/]\d{2,4})?\s*\n\s*(.+?)\s+(\d{1,2})\/(\d{1,2})\s*\n\s*\d+\s*\n\s*([\d\.\,]+)\s*(?=\n|$)/g;
+
+  for (const match of text.matchAll(multilinePattern)) {
+    const installmentNumber = Number(match[2]);
+    const installmentTotal = Number(match[3]);
+    const amount = parseAmount(match[4] ?? "");
+    const merchant = cleanMastercardInstallmentMerchant(match[1] ?? "");
+
+    if (!merchant || !isValidInstallment(installmentNumber, installmentTotal, amount)) {
+      continue;
+    }
+
+    const candidateLine = `${merchant} ${installmentNumber}/${installmentTotal} ${match[4]}`;
+    candidateLines.push(candidateLine);
+    installments.push({
+      merchant,
+      installmentNumber,
+      installmentTotal,
+      amount,
+      remainingInstallments: Math.max(installmentTotal - installmentNumber, 0)
+    });
+  }
 
   for (const rawLine of text.split("\n")) {
     const line = collapseSpaces(rawLine);
