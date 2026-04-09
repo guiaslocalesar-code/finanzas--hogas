@@ -156,8 +156,12 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
 export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview {
   const warnings: string[] = [];
   const holder = detectHolder(text, [/TITULAR DE CUENTA:\s*([^\n]+)/i], warnings, "holder");
-  const closingDate = detectDate(text, [/CIERRE ACTUAL:\s*([^\n]+)/i], warnings, "closingDate");
-  const dueDate = detectDate(text, [/VENCIMIENTO ACTUAL:\s*([^\n]+)/i], warnings, "dueDate");
+  const closingDateDetection = detectBnaLabeledDate(text, "CIERRE ACTUAL");
+  const dueDateDetection = detectBnaLabeledDate(text, "VENCIMIENTO ACTUAL");
+  const closingDate = closingDateDetection.date;
+  const dueDate = dueDateDetection.date;
+  warnMissingDate(warnings, "closingDate", closingDate);
+  warnMissingDate(warnings, "dueDate", dueDate);
   const nextDueDate = detectDate(text, [/PROXIMO VTO\.?\s*([^\n]+)/i], warnings, "nextDueDate");
   const totalAmount = detectAmount(text, [/SALDO ACTUAL:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
   const minimumPayment = detectAmount(text, [/PAGO M.{0,4}NIMO:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
@@ -179,7 +183,20 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: buildParserDebug("parseVisaBnaStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
+    rawDetectedData: buildParserDebug(
+      "parseVisaBnaStatement",
+      text,
+      warnings,
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      projections,
+      projectionAnalysis.candidateBlocks,
+      {
+        dateDetection: {
+          closingDate: closingDateDetection,
+          dueDate: dueDateDetection
+        }
+      }
+    ),
     warnings
   };
 }
@@ -717,6 +734,60 @@ function detectDate(
 
   warnings.push(`Field "${field}" could not be detected.`);
   return "";
+}
+
+type LabeledDateDetection = {
+  date: string;
+  label: string;
+  rawCandidate: string;
+  matchedRule: string;
+};
+
+function detectBnaLabeledDate(text: string, label: "VENCIMIENTO ACTUAL" | "CIERRE ACTUAL"): LabeledDateDetection {
+  const normalizedText = text.replace(/\r/g, "\n");
+  const labelPattern = label.replace(/\s+/g, "\\s+");
+  const spanishDatePattern = "(\\d{1,2}\\s+[A-Za-zÃ±Ã‘Ã¡Ã©Ã­Ã³ÃºÃÃ‰ÃÃ“Ãš]{3,12}\\.?\\s+\\d{2,4})";
+  const patterns = [
+    {
+      rule: "label-then-spanish-date-with-newlines",
+      pattern: new RegExp(`${labelPattern}:?[\\s\\S]{0,120}?${spanishDatePattern}`, "i")
+    },
+    {
+      rule: "label-then-spanish-date-same-line",
+      pattern: new RegExp(`${labelPattern}:?\\s*${spanishDatePattern}`, "i")
+    }
+  ];
+
+  for (const { rule, pattern } of patterns) {
+    const match = normalizedText.match(pattern);
+    const rawCandidate = match?.[1] ?? "";
+    if (!rawCandidate) {
+      continue;
+    }
+
+    const date = parseLooseDate(rawCandidate);
+    if (date) {
+      return {
+        date,
+        label,
+        rawCandidate: collapseSpaces(rawCandidate),
+        matchedRule: rule
+      };
+    }
+  }
+
+  return {
+    date: "",
+    label,
+    rawCandidate: "",
+    matchedRule: "not-found"
+  };
+}
+
+function warnMissingDate(warnings: string[], field: string, value: string): void {
+  if (!value) {
+    warnings.push(`Field "${field}" could not be detected.`);
+  }
 }
 
 function detectAmount(text: string, patterns: RegExp[], warnings: string[], field: string): number {
@@ -1273,8 +1344,11 @@ function monthTokenToNumber(token: string): string {
   const normalized = token.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
   const map: Record<string, string> = {
     enero: "01",
+    ene: "01",
     febrero: "02",
+    feb: "02",
     marzo: "03",
+    mar: "03",
     abril: "04",
     abr: "04",
     mayo: "05",
@@ -1288,13 +1362,13 @@ function monthTokenToNumber(token: string): string {
     septiembre: "09",
     setiembre: "09",
     sep: "09",
+    set: "09",
     octubre: "10",
     oct: "10",
     noviembre: "11",
     nov: "11",
     diciembre: "12",
-    dic: "12",
-    mar: "03"
+    dic: "12"
   };
 
   return map[normalized] ?? "";
