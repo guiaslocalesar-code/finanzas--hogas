@@ -3,8 +3,44 @@ import { AppError, type Env, type ParsedCardStatementPreview } from "./types";
 const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const GEMINI_MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-2.5-flash"] as const;
 
-const NARANJA_PROMPT =
-  "Sos un extractor de datos de resúmenes de tarjetas argentinas. Analizá el PDF de Tarjeta Naranja. Devolvé ÚNICAMENTE un JSON válido. Extraé: issuer (siempre 'Naranja X'), holder, closingDate (YYYY-MM-DD), dueDate (YYYY-MM-DD), nextDueDate (YYYY-MM-DD), totalAmount (number sin $), minimumPayment (number sin $). Además, extraé la tabla de pagos futuros en el array 'projections' (monthLabel, yearMonth, amount) y el detalle de cuotas en el array 'installmentsDetail' (merchant, installmentNumber, installmentTotal, amount). Si falta algo, poné null.";
+const NARANJA_PROMPT = `Sos un analista financiero experto en extraer datos de resúmenes de tarjetas de crédito argentinas, específicamente de Tarjeta Naranja.
+Analizá el documento y devolvé ÚNICAMENTE un JSON válido que coincida exactamente con la estructura requerida. No uses markdown.
+
+Reglas de extracción de compras (MUY IMPORTANTE):
+1. Buscá el detalle de todas las compras del mes.
+2. Si el consumo indica cuotas (ej. 'Plan Z', 'Z', '02/03', 'Cuota 1 de 3', etc.), extraé el número de la cuota actual en 'installmentNumber' y el total de cuotas en 'installmentTotal'.
+3. Si el consumo NO indica cuotas y es un pago único (ej. supermercado, débito automático, suscripciones), poné 'installmentNumber': 1 e 'installmentTotal': 1.
+4. Ignorá líneas que sean pagos de la tarjeta, intereses, mantenimiento o impuestos (IVA, Sellos). Solo me interesan los consumos reales.
+
+Estructura JSON obligatoria a devolver:
+{
+  "summary": {
+    "issuer": "Naranja X",
+    "holder": string | null,
+    "closingDate": string | null (YYYY-MM-DD),
+    "dueDate": string | null (YYYY-MM-DD),
+    "nextDueDate": string | null (YYYY-MM-DD),
+    "totalAmount": number | null,
+    "minimumPayment": number | null
+  },
+  "projections": [
+    {
+      "monthLabel": string (ej. 'Abril-26'),
+      "yearMonth": string (ej. '2026-04'),
+      "amount": number
+    }
+  ],
+  "installmentsDetail": [
+    {
+      "merchant": string (Limpiá códigos raros al inicio),
+      "purchaseDate": string | null (YYYY-MM-DD),
+      "installmentNumber": number,
+      "installmentTotal": number,
+      "amount": number (solo el monto de esta cuota, sin $),
+      "remainingInstallments": number | null
+    }
+  ]
+}`;
 
 type GeminiProjection = {
   monthLabel?: string | null;
@@ -13,13 +49,15 @@ type GeminiProjection = {
 };
 
 type GeminiInstallment = {
+  purchaseDate?: string | null;
   merchant?: string | null;
   installmentNumber?: number | string | null;
   installmentTotal?: number | string | null;
   amount?: number | string | null;
+  remainingInstallments?: number | string | null;
 };
 
-type GeminiStatementPayload = {
+type GeminiStatementSummary = {
   issuer?: string | null;
   holder?: string | null;
   closingDate?: string | null;
@@ -27,6 +65,10 @@ type GeminiStatementPayload = {
   nextDueDate?: string | null;
   totalAmount?: number | string | null;
   minimumPayment?: number | string | null;
+};
+
+type GeminiStatementPayload = GeminiStatementSummary & {
+  summary?: GeminiStatementSummary | null;
   projections?: GeminiProjection[] | null;
   installmentsDetail?: GeminiInstallment[] | null;
 };
@@ -103,11 +145,14 @@ async function requestGeminiJson(
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
+      system_instruction: {
+        parts: [{ text: NARANJA_PROMPT }]
+      },
       contents: [
         {
           role: "user",
           parts: [
-            { text: NARANJA_PROMPT },
+            { text: "Analizá este PDF de Tarjeta Naranja y devolvé el JSON requerido." },
             {
               inline_data: {
                 mime_type: "application/pdf",
@@ -122,13 +167,18 @@ async function requestGeminiJson(
         responseSchema: {
           type: "OBJECT",
           properties: {
-            issuer: { type: "STRING", nullable: true },
-            holder: { type: "STRING", nullable: true },
-            closingDate: { type: "STRING", nullable: true },
-            dueDate: { type: "STRING", nullable: true },
-            nextDueDate: { type: "STRING", nullable: true },
-            totalAmount: { type: "NUMBER", nullable: true },
-            minimumPayment: { type: "NUMBER", nullable: true },
+            summary: {
+              type: "OBJECT",
+              properties: {
+                issuer: { type: "STRING", nullable: true },
+                holder: { type: "STRING", nullable: true },
+                closingDate: { type: "STRING", nullable: true },
+                dueDate: { type: "STRING", nullable: true },
+                nextDueDate: { type: "STRING", nullable: true },
+                totalAmount: { type: "NUMBER", nullable: true },
+                minimumPayment: { type: "NUMBER", nullable: true }
+              }
+            },
             projections: {
               type: "ARRAY",
               items: {
@@ -146,9 +196,11 @@ async function requestGeminiJson(
                 type: "OBJECT",
                 properties: {
                   merchant: { type: "STRING", nullable: true },
+                  purchaseDate: { type: "STRING", nullable: true },
                   installmentNumber: { type: "NUMBER", nullable: true },
                   installmentTotal: { type: "NUMBER", nullable: true },
-                  amount: { type: "NUMBER", nullable: true }
+                  amount: { type: "NUMBER", nullable: true },
+                  remainingInstallments: { type: "NUMBER", nullable: true }
                 }
               }
             }
@@ -185,6 +237,7 @@ function isUnavailableGeminiModelError(error: AppError): boolean {
 }
 
 function normalizeGeminiStatement(parsed: GeminiStatementPayload): ParsedCardStatementPreview {
+  const summary = parsed.summary ?? parsed;
   const warnings: string[] = [];
   const projections = Array.isArray(parsed.projections)
     ? parsed.projections
@@ -198,29 +251,34 @@ function normalizeGeminiStatement(parsed: GeminiStatementPayload): ParsedCardSta
   const installmentsDetail = Array.isArray(parsed.installmentsDetail)
     ? parsed.installmentsDetail
         .map((item) => {
-          const installmentNumber = integerNumber(item.installmentNumber);
-          const installmentTotal = integerNumber(item.installmentTotal);
+          const installmentNumber = integerNumber(item.installmentNumber) || 1;
+          const installmentTotal = integerNumber(item.installmentTotal) || 1;
           return {
+            purchaseDate: isoDateOrEmpty(item.purchaseDate),
             merchant: stringOrEmpty(item.merchant),
             installmentNumber,
             installmentTotal,
             amount: currencyNumber(item.amount),
-            remainingInstallments: Math.max(installmentTotal - installmentNumber, 0)
+            remainingInstallments: Math.max(
+              integerNumber(item.remainingInstallments),
+              installmentTotal - installmentNumber,
+              0
+            )
           };
         })
-        .filter((item) => item.merchant && item.amount > 0 && item.installmentTotal > 1)
+        .filter((item) => item.merchant && item.amount > 0 && item.installmentTotal >= item.installmentNumber)
     : [];
 
   const preview: ParsedCardStatementPreview = {
     issuer: "Naranja X",
     brand: "Naranja X",
     bank: "Naranja X",
-    holder: stringOrEmpty(parsed.holder),
-    closingDate: isoDateOrEmpty(parsed.closingDate),
-    dueDate: isoDateOrEmpty(parsed.dueDate),
-    nextDueDate: isoDateOrEmpty(parsed.nextDueDate),
-    totalAmount: currencyNumber(parsed.totalAmount),
-    minimumPayment: currencyNumber(parsed.minimumPayment),
+    holder: stringOrEmpty(summary.holder),
+    closingDate: isoDateOrEmpty(summary.closingDate),
+    dueDate: isoDateOrEmpty(summary.dueDate),
+    nextDueDate: isoDateOrEmpty(summary.nextDueDate),
+    totalAmount: currencyNumber(summary.totalAmount),
+    minimumPayment: currencyNumber(summary.minimumPayment),
     projections,
     installmentsDetail,
     rawDetectedData: {

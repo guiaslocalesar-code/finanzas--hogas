@@ -1052,6 +1052,21 @@ function parseVisaInstallmentDetail(text: string): InstallmentDetailAnalysis {
     });
   }
 
+  for (const rawLine of text.split("\n")) {
+    const line = collapseSpaces(rawLine);
+    if (!line || /\bC\.\d{1,2}\/\d{1,2}\b/i.test(line) || shouldIgnoreCardConsumption(line)) {
+      continue;
+    }
+
+    const onePayment = parseVisaOnePaymentLine(line);
+    if (!onePayment) {
+      continue;
+    }
+
+    candidateLines.push(line);
+    installments.push(onePayment);
+  }
+
   return {
     installments,
     candidateLines: candidateLines.slice(0, 20)
@@ -1149,6 +1164,30 @@ function parseMastercardInstallmentDetail(text: string): InstallmentDetailAnalys
     });
   }
 
+  const onePaymentPattern =
+    /(?:^|\n)\s*(\d{1,2}[-\/][A-Za-zÁÉÍÓÚáéíóúñÑ]{3,4}\.?(?:[-\/]\d{2,4})?)\s*\n\s*((?!.*\b\d{1,2}\/\d{1,2}\b).+?)\s*\n\s*\d+\s*\n\s*([\d\.\,]+)\s*(?=\n|$)/g;
+
+  for (const match of text.matchAll(onePaymentPattern)) {
+    const rawMerchant = match[2] ?? "";
+    const merchant = cleanMastercardInstallmentMerchant(rawMerchant);
+    const amount = parseAmount(match[3] ?? "");
+
+    if (!merchant || amount <= 0 || shouldIgnoreCardConsumption(merchant)) {
+      continue;
+    }
+
+    const candidateLine = `${match[1]} ${merchant} 1/1 ${match[3]}`;
+    candidateLines.push(candidateLine);
+    installments.push({
+      purchaseDate: parseCardPurchaseDate(match[1] ?? ""),
+      merchant,
+      installmentNumber: 1,
+      installmentTotal: 1,
+      amount,
+      remainingInstallments: 0
+    });
+  }
+
   return {
     installments,
     candidateLines: candidateLines.slice(0, 20)
@@ -1214,13 +1253,70 @@ function cleanMastercardInstallmentMerchant(value: string): string {
   );
 }
 
+function parseVisaOnePaymentLine(line: string): ParsedCardStatementPreview["installmentsDetail"][number] | null {
+  const match = line.match(
+    /^\d{1,2}(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+\.?\s+\d{2,4})?\s+(?:\d{3,}\s+)?(?:[A-Z]\s+|\*\s+)?(.+?)\s+(?:USD\s+)?([\d\.\,]+)(?:\s+([\d\.\,]+))?\s*$/i
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const merchant = cleanOnePaymentMerchant(match[1] ?? "");
+  const amount = parseAmount(match[3] ?? match[2] ?? "");
+
+  if (!merchant || amount <= 0 || shouldIgnoreCardConsumption(merchant)) {
+    return null;
+  }
+
+  return {
+    purchaseDate: parseCardPurchaseDate(line),
+    merchant,
+    installmentNumber: 1,
+    installmentTotal: 1,
+    amount,
+    remainingInstallments: 0
+  };
+}
+
+function cleanOnePaymentMerchant(value: string): string {
+  return collapseSpaces(
+    value
+      .replace(/^\d{3,}\s+/, "")
+      .replace(/^[A-Z]\s+/, "")
+      .replace(/^\*\s*/, "")
+      .replace(/\s+\*+\s*/g, " ")
+      .replace(/\s+USD$/i, "")
+  );
+}
+
+function shouldIgnoreCardConsumption(value: string): boolean {
+  return /SU PAGO|PAGO EN|PAGO MINIMO|TRANSFERENCIA|DEUDA|SALDO|IMPUESTO|SELLOS?|DB IVA|IVA\b|IIBB|PERCEP|INTER[EÉ]S|COMISI[OÓ]N|MANTENIMIENTO|CARGO POR|AJUSTE/i.test(
+    value
+  );
+}
+
+function parseCardPurchaseDate(value: string): string {
+  const spanishLong = value.match(/\b(\d{1,2})\s+([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\.?\s+(\d{2,4})\b/);
+  if (spanishLong) {
+    return formatSpanishMonthDate(spanishLong[1] ?? "", spanishLong[2] ?? "", spanishLong[3] ?? "");
+  }
+
+  const mastercardShort = value.match(/\b(\d{1,2})[-\/]([A-Za-zÁÉÍÓÚáéíóúñÑ]{3,4})\.?[-\/](\d{2,4})\b/);
+  if (mastercardShort) {
+    return formatSpanishMonthDate(mastercardShort[1] ?? "", mastercardShort[2] ?? "", mastercardShort[3] ?? "");
+  }
+
+  return "";
+}
+
 function isValidInstallment(installmentNumber: number, installmentTotal: number, amount: number): boolean {
   return (
     Number.isInteger(installmentNumber) &&
     Number.isInteger(installmentTotal) &&
     installmentNumber >= 1 &&
     installmentTotal >= installmentNumber &&
-    installmentTotal > 1 &&
+    installmentTotal >= 1 &&
     amount > 0
   );
 }
@@ -1503,6 +1599,7 @@ function normalizeParsedPreview(parsed: ParsedCardStatementPreview): ParsedCardS
   );
   const installmentsDetail = (parsed.installmentsDetail ?? [])
     .map((item) => ({
+      purchaseDate: normalizeIsoDate(item.purchaseDate ?? ""),
       merchant: collapseSpaces(item.merchant),
       installmentNumber: Math.max(0, Math.trunc(item.installmentNumber)),
       installmentTotal: Math.max(0, Math.trunc(item.installmentTotal)),
@@ -1563,6 +1660,10 @@ function normalizeIsoDate(value: string): string {
   }
 
   return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function formatSpanishMonthDate(dayToken: string, monthToken: string, yearToken: string): string {
+  return parseLooseDate(`${dayToken} ${monthToken} ${yearToken}`);
 }
 
 function isIsoDate(value: string): boolean {

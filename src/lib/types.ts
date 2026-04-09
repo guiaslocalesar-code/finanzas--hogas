@@ -331,6 +331,7 @@ export interface CardStatementProjectionPreview {
 }
 
 export interface CardStatementInstallmentPreview {
+  purchaseDate?: string;
   merchant: string;
   installmentNumber: number;
   installmentTotal: number;

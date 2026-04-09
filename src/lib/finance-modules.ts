@@ -1730,12 +1730,12 @@ function buildInstallmentDetailRecordsFromPreview(
   const dueMonth = dueDate ? dueDate.slice(0, 7) : "";
 
   return preview.installmentsDetail
-    .filter((item) => item.merchant && item.amount > 0 && item.installmentTotal > 1)
+    .filter((item) => item.merchant && item.amount > 0 && item.installmentTotal >= 1)
     .map((item) => ({
       installmentId: generateId("installment"),
       summaryId: summary.summaryId,
       cardId: summary.cardId,
-      purchaseDate: "",
+      purchaseDate: normalizeIsoDateValue(item.purchaseDate ?? ""),
       merchant: item.merchant,
       installmentNumber: item.installmentNumber,
       installmentTotal: item.installmentTotal,
