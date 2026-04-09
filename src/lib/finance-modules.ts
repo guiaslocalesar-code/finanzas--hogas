@@ -1205,8 +1205,14 @@ export async function registerReimbursementPayment(
 export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthString()): Promise<CardsDashboardResponse> {
   const cards = await listCards(env);
   const statements = await listCardSummaries(env);
-  const forecast = await getInstallmentForecast(env);
-  const reimbursements = await listBusinessReimbursements(env);
+  const forecast = await getInstallmentForecast(env).catch((error) => {
+    console.error("[cards-dashboard] forecast-failed", error);
+    return emptyInstallmentForecast();
+  });
+  const reimbursements = await listBusinessReimbursements(env).catch((error) => {
+    console.error("[cards-dashboard] reimbursements-failed", error);
+    return [] as BusinessReimbursementRecord[];
+  });
   const statementsForMonth = statements
     .filter((statement) => statementYearMonth(statement) === yearMonth)
     .sort((left, right) => left.dueDate.localeCompare(right.dueDate));
@@ -1236,6 +1242,19 @@ export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthSt
         .reduce((sum, item) => sum + Math.max(0, item.businessAmount - item.reimbursedAmount), 0)
     ),
     statementPayments
+  };
+}
+
+function emptyInstallmentForecast(): InstallmentForecastResponse {
+  const baseYearMonth = currentYearMonthString();
+  return {
+    thisMonth: { yearMonth: baseYearMonth, totalAmount: 0, items: [] },
+    nextMonth: { yearMonth: addMonthsToYearMonth(baseYearMonth, 1), totalAmount: 0, items: [] },
+    thirdMonth: { yearMonth: addMonthsToYearMonth(baseYearMonth, 2), totalAmount: 0, items: [] },
+    totalPending: 0,
+    businessPending: 0,
+    personalPending: 0,
+    filters: {}
   };
 }
 
