@@ -1,7 +1,7 @@
 import { AppError, type Env, type ParsedCardStatementPreview } from "./types";
 
-const GEMINI_MODEL_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-2.5-flash"] as const;
 
 const NARANJA_PROMPT =
   "Sos un extractor de datos de resúmenes de tarjetas argentinas. Analizá el PDF de Tarjeta Naranja. Devolvé ÚNICAMENTE un JSON válido. Extraé: issuer (siempre 'Naranja X'), holder, closingDate (YYYY-MM-DD), dueDate (YYYY-MM-DD), nextDueDate (YYYY-MM-DD), totalAmount (number sin $), minimumPayment (number sin $). Además, extraé la tabla de pagos futuros en el array 'projections' (monthLabel, yearMonth, amount) y el detalle de cuotas en el array 'installmentsDetail' (merchant, installmentNumber, installmentTotal, amount). Si falta algo, poné null.";
@@ -32,6 +32,7 @@ type GeminiStatementPayload = {
 };
 
 type GeminiResponse = {
+  modelVersion?: string;
   candidates?: Array<{
     content?: {
       parts?: Array<{
@@ -58,7 +59,45 @@ export async function parseNaranjaWithGemini(
 
   const pdfBase64 =
     typeof pdfBufferOrBase64 === "string" ? pdfBufferOrBase64 : arrayBufferToBase64(pdfBufferOrBase64);
-  const response = await fetch(`${GEMINI_MODEL_URL}?key=${encodeURIComponent(apiKey)}`, {
+  const geminiResult = await generateGeminiJson(apiKey, pdfBase64);
+  const parsed = parseJson<GeminiStatementPayload>(geminiResult.jsonText, "Gemini returned invalid structured JSON.");
+  const preview = normalizeGeminiStatement(parsed);
+  preview.rawDetectedData.geminiModel = geminiResult.model;
+  preview.rawDetectedData.geminiModelVersion = geminiResult.modelVersion ?? "";
+
+  return preview;
+}
+
+async function generateGeminiJson(
+  apiKey: string,
+  pdfBase64: string
+): Promise<{ jsonText: string; model: string; modelVersion?: string }> {
+  let lastError: AppError | null = null;
+
+  for (const model of GEMINI_MODEL_CANDIDATES) {
+    try {
+      return await requestGeminiJson(apiKey, pdfBase64, model);
+    } catch (error) {
+      const appError = error instanceof AppError
+        ? error
+        : new AppError("parse", "Gemini could not parse the Naranja PDF.", String(error), 400);
+      lastError = appError;
+
+      if (!isUnavailableGeminiModelError(appError)) {
+        throw appError;
+      }
+    }
+  }
+
+  throw lastError ?? new AppError("parse", "Gemini could not parse the Naranja PDF.", undefined, 400);
+}
+
+async function requestGeminiJson(
+  apiKey: string,
+  pdfBase64: string,
+  model: string
+): Promise<{ jsonText: string; model: string; modelVersion?: string }> {
+  const response = await fetch(`${GEMINI_API_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -132,8 +171,17 @@ export async function parseNaranjaWithGemini(
     throw new AppError("parse", "Gemini response did not include JSON text.", responseText.slice(0, 1200), 400);
   }
 
-  const parsed = parseJson<GeminiStatementPayload>(jsonText, "Gemini returned invalid structured JSON.");
-  return normalizeGeminiStatement(parsed);
+  return {
+    jsonText,
+    model,
+    modelVersion: gemini.modelVersion
+  };
+}
+
+function isUnavailableGeminiModelError(error: AppError): boolean {
+  return error.details?.includes("no longer available") === true ||
+    error.details?.includes('"status": "NOT_FOUND"') === true ||
+    error.details?.includes('"status":"NOT_FOUND"') === true;
 }
 
 function normalizeGeminiStatement(parsed: GeminiStatementPayload): ParsedCardStatementPreview {
