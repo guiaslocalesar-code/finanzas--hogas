@@ -5,10 +5,12 @@ import {
   createBusinessReimbursement,
   createCard,
   createCardSummary,
+  createBudget,
   createManualInstallment,
   debugCardStatement,
   debugUploadCardStatementPdf,
   deleteCard,
+  duplicateBudgetsFromMonth,
   getCardsDashboard,
   getCardStatement,
   getCardStatementDetail,
@@ -16,6 +18,7 @@ import {
   initializeFinanceModuleSheets,
   listAccountsPayable,
   listBusinessReimbursements,
+  listBudgets,
   listCardSummaries,
   listCards,
   listInstallmentProjections,
@@ -26,6 +29,7 @@ import {
   summarizeBudgets,
   uploadCardStatementPdf,
   updateAccountPayable,
+  updateBudget,
   updateBusinessReimbursement,
   updateCard,
   updateCardStatement,
@@ -679,6 +683,64 @@ app.get("/api/budgets/summary", async (c) => {
   return c.json(summary);
 });
 
+app.get("/api/budgets", async (c) => {
+  const monthYear = normalizeYearMonthQuery(c.req.query("monthYear") ?? c.req.query("yearMonth"));
+  const budgets = await listBudgets(c.env, monthYear ?? undefined);
+  return c.json(budgets);
+});
+
+app.post("/api/budgets", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const monthYear = normalizeYearMonthQuery(stringField(payload.monthYear));
+  const monthlyLimit = parseAmount(payload.monthlyLimit);
+
+  if (!stringField(payload.category) || !monthYear || monthlyLimit === null || monthlyLimit < 0) {
+    return c.json({ error: 'Fields "category", "monthYear" and "monthlyLimit" are required.' }, 400);
+  }
+
+  const budget = await createBudget(c.env, { ...payload, monthYear, monthlyLimit });
+  return c.json(budget, 201);
+});
+
+app.patch("/api/budgets/:id", async (c) => {
+  const payload = await safeJson(c);
+  const id = c.req.param("id").trim();
+
+  if (!payload || !id) {
+    return c.json({ error: "Invalid request." }, 400);
+  }
+
+  const normalizedPayload = {
+    ...payload,
+    monthYear: "monthYear" in payload ? normalizeYearMonthQuery(stringField(payload.monthYear)) : undefined,
+    monthlyLimit: "monthlyLimit" in payload ? parseAmount(payload.monthlyLimit) : undefined
+  };
+  const budget = await updateBudget(c.env, id, normalizedPayload);
+
+  if (!budget) {
+    return c.json({ error: "Budget not found." }, 404);
+  }
+
+  return c.json(budget);
+});
+
+app.post("/api/budgets/duplicate-previous-month", async (c) => {
+  const payload = await safeJson(c);
+  const targetMonthYear =
+    normalizeYearMonthQuery(payload ? stringField(payload.targetMonthYear ?? payload.monthYear) : "") ??
+    new Date().toISOString().slice(0, 7);
+  const sourceMonthYear =
+    normalizeYearMonthQuery(payload ? stringField(payload.sourceMonthYear) : "") ??
+    addMonthsToYearMonth(targetMonthYear, -1);
+  const result = await duplicateBudgetsFromMonth(c.env, { sourceMonthYear, targetMonthYear });
+  return c.json({ ok: true, ...result });
+});
+
 app.notFound(async (c) => {
   if (c.req.method === "GET" && !c.req.path.startsWith("/api/")) {
     return c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
@@ -989,6 +1051,12 @@ function rawJsonField(value: unknown): unknown {
 function normalizeYearMonthQuery(value: unknown): string | undefined {
   const raw = stringField(value);
   return /^\d{4}-\d{2}$/.test(raw) ? raw : undefined;
+}
+
+function addMonthsToYearMonth(value: string, delta: number): string {
+  const [year, month] = value.split("-").map((item) => Number(item));
+  const date = new Date(year, (month || 1) - 1 + delta, 1);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }
 
 function numericField(value: unknown): number | undefined {

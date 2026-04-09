@@ -1343,6 +1343,94 @@ export async function summarizeBudgets(
   return { monthYear, items };
 }
 
+export async function listBudgets(env: Env, monthYear?: string): Promise<BudgetRecord[]> {
+  const snapshot = await readModuleSheet(env, BUDGET_SHEET_NAME, BUDGET_HEADERS);
+  const budgets = snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToBudget(snapshot.headers, row));
+
+  return (monthYear ? budgets.filter((budget) => budget.monthYear === monthYear) : budgets)
+    .sort((left, right) =>
+      left.monthYear.localeCompare(right.monthYear) ||
+      left.ownerType.localeCompare(right.ownerType) ||
+      left.category.localeCompare(right.category)
+    );
+}
+
+export async function createBudget(env: Env, input: Record<string, unknown>): Promise<BudgetRecord> {
+  const snapshot = await readModuleSheet(env, BUDGET_SHEET_NAME, BUDGET_HEADERS);
+  const record: BudgetRecord = {
+    id: generateId("budget"),
+    category: stringValue(input.category),
+    monthlyLimit: numberValue(input.monthlyLimit),
+    monthYear: stringValue(input.monthYear),
+    ownerType: parseOwnerType(input.ownerType) ?? "Hogar",
+    createdAt: new Date().toISOString()
+  };
+
+  await appendRow(env, BUDGET_SHEET_NAME, snapshot.headers, record);
+  return record;
+}
+
+export async function updateBudget(
+  env: Env,
+  id: string,
+  input: Record<string, unknown>
+): Promise<BudgetRecord | null> {
+  const snapshot = await readModuleSheet(env, BUDGET_SHEET_NAME, BUDGET_HEADERS);
+  const match = findRowByKey(snapshot, "id", id);
+
+  if (!match) {
+    return null;
+  }
+
+  const current = rowToBudget(snapshot.headers, match.row);
+  const updated: BudgetRecord = {
+    ...current,
+    category: "category" in input ? stringValue(input.category) : current.category,
+    monthlyLimit: "monthlyLimit" in input ? numberValue(input.monthlyLimit) : current.monthlyLimit,
+    monthYear: "monthYear" in input ? stringValue(input.monthYear) : current.monthYear,
+    ownerType: "ownerType" in input ? parseOwnerType(input.ownerType) ?? current.ownerType : current.ownerType
+  };
+
+  await updateRow(env, BUDGET_SHEET_NAME, snapshot.headers, match.index, updated);
+  return updated;
+}
+
+export async function duplicateBudgetsFromMonth(
+  env: Env,
+  input: { sourceMonthYear: string; targetMonthYear: string }
+): Promise<{ sourceMonthYear: string; targetMonthYear: string; created: BudgetRecord[]; skipped: BudgetRecord[] }> {
+  const existing = await listBudgets(env);
+  const source = existing.filter((budget) => budget.monthYear === input.sourceMonthYear);
+  const target = existing.filter((budget) => budget.monthYear === input.targetMonthYear);
+  const created: BudgetRecord[] = [];
+  const skipped: BudgetRecord[] = [];
+
+  for (const budget of source) {
+    const alreadyExists = target.some((item) =>
+      normalizeForMatch(item.category) === normalizeForMatch(budget.category) &&
+      item.ownerType === budget.ownerType
+    );
+
+    if (alreadyExists) {
+      skipped.push(budget);
+      continue;
+    }
+
+    created.push(
+      await createBudget(env, {
+        category: budget.category,
+        monthlyLimit: budget.monthlyLimit,
+        monthYear: input.targetMonthYear,
+        ownerType: budget.ownerType
+      })
+    );
+  }
+
+  return { sourceMonthYear: input.sourceMonthYear, targetMonthYear: input.targetMonthYear, created, skipped };
+}
+
 export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthString()): Promise<CardsDashboardResponse> {
   const cards = await listCards(env);
   const statements = await listCardSummaries(env);
