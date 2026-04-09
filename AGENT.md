@@ -35,6 +35,11 @@ Este repositorio contiene una app de finanzas personales migrada desde Google Ap
 - `PATCH /api/transactions` actualiza una transacción por `id`
 - `DELETE /api/transactions/:id` elimina una transacción por `id`
 - `GET /debug/sheets` se puede usar temporalmente para diagnostico de Google Sheets
+- `POST /api/setup/modules` inicializa las hojas modulares nuevas si no existen
+- `GET /api/cards`, `POST /api/cards`, `PATCH /api/cards` gestionan tarjetas
+- `GET /api/card-summaries`, `POST /api/card-summaries`, `POST /api/card-summaries/import` gestionan resúmenes de tarjeta
+- `GET /api/installments/projections`, `GET /api/installments/detail`, `PATCH /api/installments/detail`, `GET /api/installments/outlook` gestionan cuotas y proyección por mes
+- `GET /api/reimbursements`, `POST /api/reimbursements`, `PATCH /api/reimbursements` gestionan reintegros del negocio
 
 ## Formato de datos
 Headers esperados del Google Sheet:
@@ -57,6 +62,9 @@ Cada transacción debe respetar:
 - No perder columnas existentes
 - Manejar strings vacíos en fechas
 - Mantener lógica simple y predecible
+- La hoja `Transacciones` se mantiene como fuente existente y no se reestructura
+- Las hojas `Tarjetas`, `ResumenesTarjeta`, `CuotasProyectadas`, `CuotasDetalle` y `ReintegrosNegocio` deben crearse o migrarse de forma aditiva
+- Si faltan headers nuevos en esas hojas, agregarlos al final sin borrar columnas previas
 
 ## Frontend
 - No usar `google.script.run`

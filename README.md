@@ -1,53 +1,70 @@
 # A Finanzas Hogar Worker
 
-Migración de una app de finanzas personales desde Google Apps Script a Cloudflare Workers con Hono + TypeScript, manteniendo Google Sheets como base de datos.
+Migracion de una app de finanzas personales desde Google Apps Script a Cloudflare Workers con Hono + TypeScript, manteniendo Google Sheets como base de datos.
 
-## Qué incluye
+## Que incluye
 
 - API REST sobre Cloudflare Workers
-- Frontend estático servido por el mismo Worker
-- Integración con Google Sheets API v4 por HTTP directo
+- Frontend estatico servido por el mismo Worker
+- Integracion con Google Sheets API v4 por HTTP directo
 - OAuth2 con Service Account y JWT firmado manualmente
-- Deploy automático con GitHub Actions en cada push a `main`
+- Deploy automatico con GitHub Actions en cada push a `main`
+- Modulo adicional para tarjetas, resumenes, cuotas y reintegros del negocio
 
 ## Estructura
 
 ```text
 .
-├── .github/workflows/deploy.yml
-├── AGENT.md
-├── README.md
-├── package.json
-├── tsconfig.json
-├── wrangler.toml
-└── src
-    ├── index.ts
-    ├── lib
-    │   ├── google-auth.ts
-    │   ├── sheets.ts
-    │   └── types.ts
-    └── static
-        └── index.html
+|-- .github/workflows/deploy.yml
+|-- AGENT.md
+|-- README.md
+|-- package.json
+|-- tsconfig.json
+|-- wrangler.toml
+`-- src
+    |-- index.ts
+    |-- lib
+    |   |-- finance-modules.ts
+    |   |-- google-auth.ts
+    |   |-- sheets.ts
+    |   `-- types.ts
+    `-- static
+        `-- index.html
 ```
 
 ## Requisitos previos
 
 - Node.js 20 o superior
 - Cuenta de Cloudflare con Workers habilitado
-- Un Google Sheet existente con una pestaña llamada `Transacciones`
+- Un Google Sheet existente con una pestana llamada `Transacciones`
 - Una Google Service Account con acceso al Google Sheet
 
-## Headers esperados en Google Sheets
+## Hojas y headers esperados
 
-La pestaña `Transacciones` usa estos headers:
+La pestana `Transacciones` usa estos headers:
 
 ```text
 id,type,amount,category,description,date,createdAt,dueDate
 ```
 
-Si la hoja está vacía, el Worker crea esos headers automáticamente en la primera fila.
+Si la hoja esta vacia, el Worker crea esos headers automaticamente en la primera fila.
 
-## Instalación local
+La ampliacion modular de tarjetas usa estas hojas adicionales:
+
+- `Tarjetas`
+  - `cardId,issuer,brand,bank,holder,last4,closeDay,dueDay,active,createdAt`
+- `ResumenesTarjeta`
+  - `summaryId,cardId,issuer,bank,holder,fileName,statementDate,closingDate,dueDate,nextDueDate,totalAmount,minimumPayment,currency,rawText,parseStatus,createdAt`
+- `CuotasProyectadas`
+  - `projectionId,summaryId,cardId,issuer,monthLabel,yearMonth,amount,sourceType,confirmed,createdAt`
+- `CuotasDetalle`
+  - `installmentId,summaryId,cardId,purchaseDate,merchant,installmentNumber,installmentTotal,amount,dueMonth,dueDate,ownerType,businessPercent,businessAmount,personalAmount,reimbursementStatus,notes,createdAt`
+- `ReintegrosNegocio`
+  - `reimbursementId,sourceType,sourceId,cardId,concept,totalPaid,businessAmount,personalAmount,reimbursementStatus,reimbursementDueDate,reimbursedAmount,reimbursedDate,notes,createdAt`
+
+Estas hojas se crean o migran en forma aditiva con `POST /api/setup/modules` o al usar por primera vez los endpoints nuevos.
+
+## Instalacion local
 
 1. Instalar dependencias:
 
@@ -57,7 +74,7 @@ Si la hoja está vacía, el Worker crea esos headers automáticamente en la prim
 
 2. Configurar variables del Worker.
 
-   En `wrangler.toml` dejá:
+   En Cloudflare defini:
 
    - `SPREADSHEET_ID`
    - `SERVICE_ACCOUNT_EMAIL`
@@ -68,7 +85,7 @@ Si la hoja está vacía, el Worker crea esos headers automáticamente en la prim
    npx wrangler secret put PRIVATE_KEY
    ```
 
-   Pegá la private key completa de la Service Account. Si la guardás con `\n`, el código la normaliza.
+   Pega la private key completa de la Service Account. Si la guardas con `\n`, el codigo la normaliza.
 
 4. Levantar el entorno local:
 
@@ -86,15 +103,15 @@ Si la hoja está vacía, el Worker crea esos headers automáticamente en la prim
 
 ### En GitHub Actions
 
-Agregar estos secrets y variables en el repositorio:
+Agregar estos repository secrets:
 
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_API_TOKEN`
 - `PRIVATE_KEY`
-- `SPREADSHEET_ID` como Repository Variable
-- `SERVICE_ACCOUNT_EMAIL` como Repository Variable
+- `SPREADSHEET_ID`
+- `SERVICE_ACCOUNT_EMAIL`
 
-## Cómo obtener y compartir la Service Account
+## Como obtener y compartir la Service Account
 
 1. Crear una Service Account en Google Cloud.
 2. Habilitar la Google Sheets API en el proyecto.
@@ -109,30 +126,29 @@ Importante:
 - No subir el JSON de credenciales al repositorio.
 - No hardcodear la `PRIVATE_KEY`.
 
-## Cómo configurar GitHub Actions
+## Como configurar GitHub Actions
 
 1. Ir a `Settings > Secrets and variables > Actions`.
 2. Crear los secrets:
    - `CLOUDFLARE_ACCOUNT_ID`
    - `CLOUDFLARE_API_TOKEN`
    - `PRIVATE_KEY`
-3. Crear las variables:
    - `SPREADSHEET_ID`
    - `SERVICE_ACCOUNT_EMAIL`
-4. Hacer push a la rama `main`.
+3. Hacer push a la rama `main`.
 
 El workflow ejecuta:
 
 - `npm ci`
 - `npm run typecheck`
-- `wrangler deploy --var ...`
-- sincronización del secret `PRIVATE_KEY` en Cloudflare
+- `wrangler deploy`
+- sincronizacion del secret `PRIVATE_KEY` en Cloudflare
 
-## Cómo configurar Cloudflare
+## Como configurar Cloudflare
 
 1. Crear el Worker.
-2. Actualizar `wrangler.toml` con el `name` final y `SPREADSHEET_ID`.
-3. Definir `SERVICE_ACCOUNT_EMAIL` en `wrangler.toml` o como variable del entorno.
+2. Actualizar `wrangler.toml` con el `name` final.
+3. Definir `SPREADSHEET_ID` y `SERVICE_ACCOUNT_EMAIL` como variables del Worker.
 4. Cargar el secret:
 
    ```bash
@@ -145,8 +161,6 @@ El workflow ejecuta:
    npm run deploy
    ```
 
-Si desplegás por GitHub Actions, el workflow sube `PRIVATE_KEY` y pasa `SPREADSHEET_ID` y `SERVICE_ACCOUNT_EMAIL` desde GitHub automáticamente.
-
 ## Endpoints
 
 - `GET /`
@@ -155,11 +169,25 @@ Si desplegás por GitHub Actions, el workflow sube `PRIVATE_KEY` y pasa `SPREADS
 - `POST /api/transactions`
 - `PATCH /api/transactions`
 - `DELETE /api/transactions/:id`
-- `GET /debug/sheets` temporal para diagnostico
+- `GET /debug/sheets`
+- `POST /api/setup/modules`
+- `GET /api/cards`
+- `POST /api/cards`
+- `PATCH /api/cards`
+- `GET /api/card-summaries`
+- `POST /api/card-summaries`
+- `POST /api/card-summaries/import`
+- `GET /api/installments/projections`
+- `GET /api/installments/detail`
+- `PATCH /api/installments/detail`
+- `GET /api/installments/outlook`
+- `GET /api/reimbursements`
+- `POST /api/reimbursements`
+- `PATCH /api/reimbursements`
 
-## Contrato de datos
+## Contrato de datos base
 
-Cada transacción responde este formato:
+Cada transaccion responde este formato:
 
 ```json
 {
@@ -176,12 +204,12 @@ Cada transacción responde este formato:
 
 Notas:
 
-- `amount` sale siempre como número.
-- `dueDate` se conserva aunque esté vacío.
-- Las fechas vacías se devuelven como string vacío.
+- `amount` sale siempre como numero.
+- `dueDate` se conserva aunque este vacio.
+- Las fechas vacias se devuelven como string vacio.
 - Si existen columnas extra en el sheet, no se rompen las operaciones de update.
 
-## Cómo funciona la autenticación Google
+## Como funciona la autenticacion Google
 
 El Worker:
 
@@ -193,9 +221,10 @@ El Worker:
 
 ## Notas de despliegue
 
-- El primer despliegue puede requerir verificar que el nombre del Worker esté libre.
+- El primer despliegue puede requerir verificar que el nombre del Worker este libre.
 - El tab `Transacciones` debe existir dentro del spreadsheet.
 - Si el sheet ya tiene datos, la primera fila se interpreta como headers.
+- Las hojas nuevas del modulo de tarjetas se crean sin tocar la estructura de `Transacciones`.
 
 ## Referencias usadas
 

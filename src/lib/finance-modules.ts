@@ -1,4 +1,5 @@
 import { getGoogleAccessToken } from "./google-auth";
+import { parseNaranjaWithGemini } from "./gemini";
 import { detectIssuerFromText, extractPdfText, parseDetectedStatement } from "./pdf-statements";
 import {
   AppError,
@@ -289,7 +290,7 @@ export async function uploadCardStatementPdf(
     }))
   });
 
-  const analysis = await analyzeUploadedCardStatement(fileName, input.pdfBytes);
+  const analysis = await analyzeUploadedCardStatement(env, fileName, input.pdfBytes);
 
   if (input.previewOnly) {
     logUploadStage("preview-return", {
@@ -417,7 +418,7 @@ export async function debugUploadCardStatementPdf(
     sheetsReady: setupResult.sheets.length
   });
 
-  const analysis = await analyzeUploadedCardStatement(input.fileName, input.pdfBytes);
+  const analysis = await analyzeUploadedCardStatement(env, input.fileName, input.pdfBytes);
 
   return {
     ok: true,
@@ -540,6 +541,7 @@ export async function debugCardStatement(env: Env, summaryId: string): Promise<C
 }
 
 async function analyzeUploadedCardStatement(
+  env: Env,
   fileName: string,
   pdfBytes: ArrayBuffer
 ): Promise<{
@@ -565,13 +567,10 @@ async function analyzeUploadedCardStatement(
       error: appError.message,
       details: appError.details ?? ""
     });
-    return {
-      rawText: "",
-      detectedIssuer: fallbackIssuer,
-      textExtractedLength: 0,
-      preview: buildPdfFallbackPreview(fileName, appError.message, fallbackIssuer),
-      canSave: false
-    };
+    const fallbackPreview = fallbackIssuer === "naranja-x"
+      ? await tryParseNaranjaWithGemini(env, pdfBytes, buildPdfFallbackPreview(fileName, appError.message, fallbackIssuer))
+      : buildPdfFallbackPreview(fileName, appError.message, fallbackIssuer);
+    return buildAnalysisResult("", fallbackPreview, fallbackIssuer, 0);
   }
 
   try {
@@ -605,13 +604,11 @@ async function analyzeUploadedCardStatement(
     preview = buildPdfFallbackPreview(fileName, appError.message, detectedIssuer);
   }
 
-  return {
-    rawText,
-    preview,
-    detectedIssuer,
-    textExtractedLength: rawText.length,
-    canSave: Boolean(preview.dueDate || preview.totalAmount > 0 || preview.projections.length > 0)
-  };
+  if (detectedIssuer === "naranja-x" && shouldUseGeminiForNaranja(preview)) {
+    preview = await tryParseNaranjaWithGemini(env, pdfBytes, preview);
+  }
+
+  return buildAnalysisResult(rawText, preview, detectedIssuer, rawText.length);
 }
 
 async function appendCardSummaryFromUpload(
@@ -692,6 +689,96 @@ function buildPdfFallbackPreview(fileName: string, message: string, detectedIssu
       message,
       "Podés continuar con la carga manual."
     ]
+  };
+}
+
+async function tryParseNaranjaWithGemini(
+  env: Env,
+  pdfBytes: ArrayBuffer,
+  fallbackPreview: ParsedCardStatementPreview
+): Promise<ParsedCardStatementPreview> {
+  logUploadStage("gemini-naranja-start", {
+    fallbackWarnings: fallbackPreview.warnings.length
+  });
+
+  try {
+    const geminiPreview = await parseNaranjaWithGemini(pdfBytes, env);
+    logUploadStage("gemini-naranja-success", {
+      dueDate: geminiPreview.dueDate,
+      totalAmount: geminiPreview.totalAmount,
+      projections: geminiPreview.projections.length,
+      installmentsDetail: geminiPreview.installmentsDetail.length,
+      warnings: geminiPreview.warnings.length
+    });
+
+    return {
+      ...geminiPreview,
+      rawDetectedData: {
+        ...geminiPreview.rawDetectedData,
+        parseSource: "gemini",
+        fallbackWarnings: fallbackPreview.warnings
+      },
+      warnings: Array.from(new Set([...geminiPreview.warnings, ...fallbackPreview.warnings])).filter(
+        (warning) => !/continuar|carga manual|fallback especial|no expone texto legible/i.test(warning)
+      )
+    };
+  } catch (error) {
+    const appError = error instanceof AppError
+      ? error
+      : new AppError("parse", "Gemini fallback failed.", String(error), 400);
+    logUploadStage("gemini-naranja-failed", {
+      error: appError.message,
+      details: appError.details ?? ""
+    });
+
+    return {
+      ...fallbackPreview,
+      rawDetectedData: {
+        ...fallbackPreview.rawDetectedData,
+        geminiFallbackAttempted: true,
+        geminiFallbackError: appError.message,
+        parseSource: "fallback-manual-required"
+      },
+      warnings: Array.from(
+        new Set([
+          ...fallbackPreview.warnings,
+          "Fallback Gemini para Naranja no disponible. Podés continuar con la carga manual.",
+          appError.message
+        ])
+      )
+    };
+  }
+}
+
+function shouldUseGeminiForNaranja(preview: ParsedCardStatementPreview): boolean {
+  const source = String(preview.rawDetectedData.parseSource ?? "");
+  const isNaranja = preview.issuer.toLowerCase().includes("naranja") || preview.brand.toLowerCase().includes("naranja");
+  const hasUsefulData = Boolean(preview.dueDate || preview.totalAmount > 0 || preview.projections.length > 0);
+  const hasExtractorWarning = preview.warnings.some((warning) =>
+    /no readable text|no expone texto|fallback especial|carga manual|no se pudo parsear/i.test(warning)
+  );
+
+  return isNaranja && (!hasUsefulData || source === "fallback-manual-required" || hasExtractorWarning);
+}
+
+function buildAnalysisResult(
+  rawText: string,
+  preview: ParsedCardStatementPreview,
+  detectedIssuer: string,
+  textExtractedLength: number
+): {
+  rawText: string;
+  preview: ParsedCardStatementPreview;
+  detectedIssuer: string;
+  textExtractedLength: number;
+  canSave: boolean;
+} {
+  return {
+    rawText,
+    preview,
+    detectedIssuer,
+    textExtractedLength,
+    canSave: Boolean(preview.dueDate || preview.totalAmount > 0 || preview.projections.length > 0)
   };
 }
 

@@ -127,6 +127,7 @@ export interface Env {
   SPREADSHEET_ID: string;
   SERVICE_ACCOUNT_EMAIL: string;
   PRIVATE_KEY: string;
+  GEMINI_API_KEY?: string;
   ASSETS: AssetFetcher;
 }
 

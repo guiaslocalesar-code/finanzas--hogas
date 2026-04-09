@@ -171,6 +171,7 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
   const minimumPayment = detectAmount(text, [/PAGO M.{0,4}NIMO:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
   const projectionAnalysis = parseBnaStyleProjections(text);
   const projections = projectionAnalysis.projections;
+  const installmentAnalysis = parseVisaBnaInstallmentDetail(text);
 
   if (projections.length === 0) {
     warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Visa BNA.");
@@ -187,7 +188,7 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
     totalAmount,
     minimumPayment,
     projections,
-    installmentsDetail: [],
+    installmentsDetail: installmentAnalysis.installments,
     rawDetectedData: buildParserDebug(
       "parseVisaBnaStatement",
       text,
@@ -199,7 +200,9 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
         dateDetection: {
           closingDate: closingDateDetection,
           dueDate: dueDateDetection
-        }
+        },
+        installmentsDetailFound: installmentAnalysis.installments.length,
+        installmentCandidateLines: installmentAnalysis.candidateLines
       }
     ),
     warnings
@@ -1055,6 +1058,40 @@ function parseVisaInstallmentDetail(text: string): InstallmentDetailAnalysis {
   };
 }
 
+function parseVisaBnaInstallmentDetail(text: string): InstallmentDetailAnalysis {
+  const installments: ParsedCardStatementPreview["installmentsDetail"] = [];
+  const candidateLines: string[] = [];
+  const cleanedText = buildVisaBnaInstallmentSearchText(text);
+  const pattern =
+    /([A-Z0-9][A-Z0-9\s\.\-&\/]{2,80}?)\s+C\.(\d{1,2})\/(\d{1,2})\s+(\d{1,3}(?:\.\d{3})*,\d{2})/gi;
+
+  for (const match of cleanedText.matchAll(pattern)) {
+    const installmentNumber = Number(match[2]);
+    const installmentTotal = Number(match[3]);
+    const amount = parseAmount(match[4] ?? "");
+    const merchant = cleanVisaBnaInstallmentMerchant(match[1] ?? "");
+
+    if (!merchant || !isValidInstallment(installmentNumber, installmentTotal, amount)) {
+      continue;
+    }
+
+    const candidateLine = collapseSpaces(match[0] ?? "");
+    candidateLines.push(candidateLine);
+    installments.push({
+      merchant,
+      installmentNumber,
+      installmentTotal,
+      amount,
+      remainingInstallments: Math.max(installmentTotal - installmentNumber, 0)
+    });
+  }
+
+  return {
+    installments,
+    candidateLines: candidateLines.slice(0, 20)
+  };
+}
+
 function parseMastercardInstallmentDetail(text: string): InstallmentDetailAnalysis {
   const installments: ParsedCardStatementPreview["installmentsDetail"] = [];
   const candidateLines: string[] = [];
@@ -1095,6 +1132,33 @@ function parseMastercardInstallmentDetail(text: string): InstallmentDetailAnalys
   };
 }
 
+function buildVisaBnaInstallmentSearchText(text: string): string {
+  const lines = text
+    .split("\n")
+    .map((line) => collapseSpaces(line))
+    .filter(Boolean);
+  const tokens: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const current = lines[index] ?? "";
+    const previous = tokens[tokens.length - 1] ?? "";
+
+    if (/^\d{1,2}$/.test(current) && /,\d$/.test(previous)) {
+      tokens[tokens.length - 1] = `${previous}${current}`;
+      continue;
+    }
+
+    if (/^\d$/.test(current) && /,\d$/.test(previous)) {
+      tokens[tokens.length - 1] = `${previous}${current}`;
+      continue;
+    }
+
+    tokens.push(current);
+  }
+
+  return collapseSpaces(tokens.join(" "));
+}
+
 function cleanVisaInstallmentMerchant(value: string): string {
   return collapseSpaces(
     value
@@ -1104,6 +1168,18 @@ function cleanVisaInstallmentMerchant(value: string): string {
       .replace(/\s+\*+\s*/g, " ")
       .replace(/\b\d{3,}\b/g, "")
   );
+}
+
+function cleanVisaBnaInstallmentMerchant(value: string): string {
+  const tokens = collapseSpaces(value)
+    .replace(/\b\d{1,2}\s+(?:ene|feb|mar|abr|may|jun|jul|ago|sep|set|oct|nov|dic)\.?\s+\d{2,4}\b/gi, " ")
+    .replace(/\b\d{2,}\b/g, " ")
+    .replace(/\s+\*+\s*/g, " ")
+    .split(" ")
+    .filter(Boolean);
+  const tail = tokens.slice(-4).join(" ");
+
+  return collapseSpaces(tail);
 }
 
 function cleanMastercardInstallmentMerchant(value: string): string {
