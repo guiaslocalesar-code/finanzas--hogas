@@ -19,6 +19,7 @@ import {
   type CardStatementDetailResult,
   type CardsDashboardResponse,
   type CardRecord,
+  type CardStatementPaymentDashboardItem,
   type CardSummaryImportResult,
   type CardSummaryRecord,
   type DebugCardStatementResult,
@@ -196,6 +197,8 @@ export async function createCardSummary(env: Env, input: Record<string, unknown>
     rawDetectedData: stringifyJsonField(input.rawDetectedData),
     warnings: stringifyJsonField(input.warnings),
     parseStatus: stringValue(input.parseStatus) || "manual",
+    paidAmount: numberValue(input.paidAmount),
+    status: normalizeStatementPaymentStatus(input.status, numberValue(input.paidAmount), numberValue(input.totalAmount)),
     createdAt: new Date().toISOString()
   };
 
@@ -248,7 +251,34 @@ export async function updateCardStatement(
     rawText: "rawText" in input ? stringValue(input.rawText) : current.rawText,
     rawDetectedData: "rawDetectedData" in input ? stringifyJsonField(input.rawDetectedData) : current.rawDetectedData,
     warnings: "warnings" in input ? stringifyJsonField(input.warnings) : current.warnings,
-    parseStatus: "parseStatus" in input ? stringValue(input.parseStatus) : current.parseStatus
+    parseStatus: "parseStatus" in input ? stringValue(input.parseStatus) : current.parseStatus,
+    paidAmount: "paidAmount" in input ? numberValue(input.paidAmount) : current.paidAmount,
+    status: "status" in input
+      ? normalizeStatementPaymentStatus(input.status, current.paidAmount, current.totalAmount)
+      : normalizeStatementPaymentStatus(current.status, current.paidAmount, current.totalAmount)
+  };
+
+  await updateRow(env, CARD_SUMMARY_SHEET_NAME, snapshot.headers, match.index, updated);
+  return updated;
+}
+
+export async function registerCardStatementPayment(
+  env: Env,
+  input: { summaryId: string; amount: number }
+): Promise<CardSummaryRecord | null> {
+  const snapshot = await readModuleSheet(env, CARD_SUMMARY_SHEET_NAME, CARD_SUMMARY_HEADERS);
+  const match = findRowByKey(snapshot, "summaryId", input.summaryId);
+
+  if (!match) {
+    return null;
+  }
+
+  const current = rowToCardSummary(snapshot.headers, match.row);
+  const nextPaidAmount = roundCurrency(current.paidAmount + Math.max(0, numberValue(input.amount)));
+  const updated: CardSummaryRecord = {
+    ...current,
+    paidAmount: nextPaidAmount,
+    status: normalizeStatementPaymentStatus(undefined, nextPaidAmount, current.totalAmount)
   };
 
   await updateRow(env, CARD_SUMMARY_SHEET_NAME, snapshot.headers, match.index, updated);
@@ -644,6 +674,8 @@ async function appendCardSummaryFromUpload(
     rawDetectedData: stringifyJsonField(input.preview.rawDetectedData),
     warnings: stringifyJsonField(input.preview.warnings),
     parseStatus: input.preview.warnings.length > 0 ? "parsed-with-warnings" : "parsed",
+    paidAmount: 0,
+    status: "PENDING",
     createdAt: new Date().toISOString()
   };
 
@@ -913,7 +945,7 @@ export async function createManualInstallment(
     businessAmount,
     personalAmount,
     reimbursementStatus,
-    notes: stringValue(input.notes),
+    notes: normalizeOwnerNotes(stringValue(input.notes), ownerType),
     createdAt: new Date().toISOString()
   };
 
@@ -971,7 +1003,7 @@ export async function updateInstallmentDetail(
     businessAmount,
     personalAmount,
     reimbursementStatus,
-    notes: "notes" in input ? stringValue(input.notes) : current.notes
+    notes: normalizeOwnerNotes("notes" in input ? stringValue(input.notes) : current.notes, ownerType)
   };
 
   await updateRow(env, INSTALLMENT_DETAIL_SHEET_NAME, snapshot.headers, match.index, updated);
@@ -1156,17 +1188,25 @@ export async function registerReimbursementPayment(
   });
 }
 
-export async function getCardsDashboard(env: Env): Promise<CardsDashboardResponse> {
+export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthString()): Promise<CardsDashboardResponse> {
   const cards = await listCards(env);
   const statements = await listCardSummaries(env);
   const forecast = await getInstallmentForecast(env);
   const reimbursements = await listBusinessReimbursements(env);
+  const statementsForMonth = statements
+    .filter((statement) => statementYearMonth(statement) === yearMonth)
+    .sort((left, right) => left.dueDate.localeCompare(right.dueDate));
+  const statementPayments = buildStatementPaymentDashboardItems(statementsForMonth, cards);
 
   return {
+    yearMonth,
     activeCards: cards.filter((card) => card.active).length,
     inactiveCards: cards.filter((card) => !card.active).length,
     statementCount: statements.length,
     statementsTotal: roundCurrency(statements.reduce((sum, item) => sum + item.totalAmount, 0)),
+    statementsTotalForMonth: roundCurrency(statementPayments.reduce((sum, item) => sum + item.totalAmount, 0)),
+    statementsPaidForMonth: roundCurrency(statementPayments.reduce((sum, item) => sum + item.paidAmount, 0)),
+    statementsRemainingForMonth: roundCurrency(statementPayments.reduce((sum, item) => sum + item.remainingAmount, 0)),
     minimumPaymentsTotal: roundCurrency(statements.reduce((sum, item) => sum + item.minimumPayment, 0)),
     pendingInstallmentsThisMonth: forecast.thisMonth.items.length,
     pendingInstallmentsNextMonth: forecast.nextMonth.items.length,
@@ -1180,7 +1220,8 @@ export async function getCardsDashboard(env: Env): Promise<CardsDashboardRespons
       reimbursements
         .filter((item) => item.reimbursementStatus !== "paid")
         .reduce((sum, item) => sum + Math.max(0, item.businessAmount - item.reimbursedAmount), 0)
-    )
+    ),
+    statementPayments
   };
 }
 
@@ -1742,7 +1783,7 @@ function buildInstallmentDetailRecordsFromPreview(
       amount: roundCurrency(item.amount),
       dueMonth,
       dueDate,
-      ownerType: "personal" as const,
+      ownerType: "Leandro" as const,
       businessPercent: 0,
       businessAmount: 0,
       personalAmount: roundCurrency(item.amount),
@@ -1856,8 +1897,46 @@ function rowToCardSummary(headers: string[], row: string[]): CardSummaryRecord {
     rawDetectedData: stringValue(record.rawDetectedData),
     warnings: stringValue(record.warnings),
     parseStatus: stringValue(record.parseStatus),
+    paidAmount: numberValue(record.paidAmount),
+    status: normalizeStatementPaymentStatus(record.status, numberValue(record.paidAmount), numberValue(record.totalAmount)),
     createdAt: stringValue(record.createdAt)
   };
+}
+
+function buildStatementPaymentDashboardItems(
+  statements: CardSummaryRecord[],
+  cards: CardRecord[]
+): CardStatementPaymentDashboardItem[] {
+  return statements.map((statement) => {
+    const card = cards.find((item) => item.cardId === statement.cardId);
+    const issuer = statement.issuer || card?.issuer || "Tarjeta";
+    const bank = statement.bank || card?.bank || "";
+    const last4 = card?.last4 ?? "";
+    const paidAmount = roundCurrency(Math.min(statement.paidAmount, Math.max(statement.totalAmount, statement.paidAmount)));
+    const remainingAmount = roundCurrency(Math.max(0, statement.totalAmount - paidAmount));
+    const status = normalizeStatementPaymentStatus(statement.status, paidAmount, statement.totalAmount);
+
+    return {
+      summaryId: statement.summaryId,
+      cardId: statement.cardId,
+      cardLabel: [issuer, bank, last4 ? `**** ${last4}` : ""].filter(Boolean).join(" · "),
+      issuer,
+      bank,
+      holder: statement.holder || card?.holder || "",
+      last4,
+      closingDate: statement.closingDate,
+      dueDate: statement.dueDate,
+      totalAmount: statement.totalAmount,
+      minimumPayment: statement.minimumPayment,
+      paidAmount,
+      remainingAmount,
+      status
+    };
+  });
+}
+
+function statementYearMonth(statement: CardSummaryRecord): string {
+  return (statement.dueDate || statement.closingDate || statement.statementDate || statement.createdAt).slice(0, 7);
 }
 
 function rowToInstallmentProjection(headers: string[], row: string[]): InstallmentProjectionRecord {
@@ -2317,11 +2396,11 @@ function deriveReimbursementStatus(
 }
 
 function normalizeBusinessPercent(value: number, ownerType: OwnerType): number {
-  if (ownerType === "personal") {
+  if (ownerType === "personal" || ownerType === "Leandro" || ownerType === "Johana" || ownerType === "Hogar") {
     return 0;
   }
 
-  if (ownerType === "business") {
+  if (ownerType === "business" || ownerType === "Negocio") {
     return 100;
   }
 
@@ -2333,7 +2412,48 @@ function normalizeBusinessPercent(value: number, ownerType: OwnerType): number {
 }
 
 function parseOwnerType(value: unknown): OwnerType | null {
-  return value === "personal" || value === "business" || value === "mixed" ? value : null;
+  const raw = stringValue(value);
+  const normalized = raw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const aliases: Record<string, OwnerType> = {
+    personal: "personal",
+    business: "business",
+    mixed: "mixed",
+    leandro: "Leandro",
+    johana: "Johana",
+    hogar: "Hogar",
+    negocio: "Negocio"
+  };
+
+  return aliases[normalized] ?? null;
+}
+
+function normalizeOwnerNotes(notes: string, ownerType: OwnerType): string {
+  if (ownerType !== "Hogar" || /50\s*\/\s*50|hogar/i.test(notes)) {
+    return notes;
+  }
+
+  return notes ? `${notes} | Hogar 50/50` : "Hogar 50/50";
+}
+
+function normalizeStatementPaymentStatus(
+  value: unknown,
+  paidAmount: number,
+  totalAmount: number
+): CardSummaryRecord["status"] {
+  const explicit = stringValue(value).toUpperCase();
+  if (explicit === "PENDING" || explicit === "PARTIAL" || explicit === "PAID") {
+    return explicit;
+  }
+
+  if (totalAmount > 0 && paidAmount >= totalAmount) {
+    return "PAID";
+  }
+
+  if (paidAmount > 0) {
+    return "PARTIAL";
+  }
+
+  return "PENDING";
 }
 
 function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {

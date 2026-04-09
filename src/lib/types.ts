@@ -46,6 +46,8 @@ export const CARD_SUMMARY_HEADERS = [
   "rawDetectedData",
   "warnings",
   "parseStatus",
+  "paidAmount",
+  "status",
   "createdAt"
 ] as const;
 
@@ -103,7 +105,7 @@ export const BUSINESS_REIMBURSEMENT_HEADERS = [
 ] as const;
 
 export type TransactionType = "income" | "expense";
-export type OwnerType = "personal" | "business" | "mixed";
+export type OwnerType = "personal" | "business" | "mixed" | "Leandro" | "Johana" | "Hogar" | "Negocio";
 export type ReimbursementStatus = "pending" | "partial" | "paid";
 export type AppErrorStep =
   | "env"
@@ -196,6 +198,8 @@ export interface CardSummaryRecord extends Record<string, string | number | bool
   rawDetectedData: string;
   warnings: string;
   parseStatus: string;
+  paidAmount: number;
+  status: "PENDING" | "PARTIAL" | "PAID";
   createdAt: string;
 }
 
@@ -308,10 +312,14 @@ export interface InstallmentForecastResponse {
 }
 
 export interface CardsDashboardResponse {
+  yearMonth: string;
   activeCards: number;
   inactiveCards: number;
   statementCount: number;
   statementsTotal: number;
+  statementsTotalForMonth: number;
+  statementsPaidForMonth: number;
+  statementsRemainingForMonth: number;
   minimumPaymentsTotal: number;
   pendingInstallmentsThisMonth: number;
   pendingInstallmentsNextMonth: number;
@@ -322,6 +330,24 @@ export interface CardsDashboardResponse {
   reimbursementsPartial: number;
   reimbursementsPaid: number;
   reimbursableAmountPending: number;
+  statementPayments: CardStatementPaymentDashboardItem[];
+}
+
+export interface CardStatementPaymentDashboardItem {
+  summaryId: string;
+  cardId: string;
+  cardLabel: string;
+  issuer: string;
+  bank: string;
+  holder: string;
+  last4: string;
+  closingDate: string;
+  dueDate: string;
+  totalAmount: number;
+  minimumPayment: number;
+  paidAmount: number;
+  remainingAmount: number;
+  status: "PENDING" | "PARTIAL" | "PAID";
 }
 
 export interface CardStatementProjectionPreview {

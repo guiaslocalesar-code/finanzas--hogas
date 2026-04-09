@@ -18,6 +18,7 @@ import {
   listCards,
   listInstallmentProjections,
   listInstallments,
+  registerCardStatementPayment,
   registerReimbursementPayment,
   uploadCardStatementPdf,
   updateBusinessReimbursement,
@@ -310,6 +311,48 @@ app.post("/api/card-statements/upload", async (c) => {
   }
 });
 
+app.post("/api/card-statements/pay", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const summaryId = stringField(payload.summaryId);
+  const amount = parseAmount(payload.amount);
+  const paymentDate = dateField(payload.paymentDate) || new Date().toISOString().slice(0, 10);
+
+  if (!summaryId) {
+    return c.json({ error: 'Field "summaryId" is required.' }, 400);
+  }
+
+  if (amount === null || amount <= 0) {
+    return c.json({ error: 'Field "amount" must be a valid number greater than zero.' }, 400);
+  }
+
+  const summary = await registerCardStatementPayment(c.env, { summaryId, amount });
+
+  if (!summary) {
+    return c.json({ error: "Statement not found." }, 404);
+  }
+
+  const createExpense = payload.createTransaction !== false;
+  const transaction = createExpense
+    ? await createTransaction(c.env, {
+      id: Date.now().toString(),
+      type: "expense",
+      amount,
+      category: "Tarjetas",
+      description: `Pago tarjeta ${summary.issuer || summary.bank || summary.summaryId}`,
+      date: paymentDate,
+      dueDate: "",
+      createdAt: new Date().toISOString()
+    })
+    : null;
+
+  return c.json({ ok: true, summary, transaction });
+});
+
 app.post("/debug/card-statements/upload-test", async (c) => {
   console.log("[card-statements/upload-test]", JSON.stringify({ stage: "endpoint-enter" }));
 
@@ -545,7 +588,7 @@ app.post("/api/reimbursements/register-payment", async (c) => {
 });
 
 app.get("/api/cards/dashboard", async (c) => {
-  const dashboard = await getCardsDashboard(c.env);
+  const dashboard = await getCardsDashboard(c.env, normalizeYearMonthQuery(c.req.query("yearMonth")));
   return c.json(dashboard);
 });
 
@@ -740,7 +783,10 @@ function validateInstallmentPayload(
   }
 
   if ("ownerType" in payload && !ownerType) {
-    return { ok: false, error: 'Field "ownerType" must be "personal", "business" or "mixed".' };
+    return {
+      ok: false,
+      error: 'Field "ownerType" must be "Leandro", "Johana", "Hogar", "Negocio" or a legacy value.'
+    };
   }
 
   if ("reimbursementStatus" in payload && !reimbursementStatus) {
@@ -851,6 +897,11 @@ function dateField(value: unknown): string {
 
 function rawJsonField(value: unknown): unknown {
   return value;
+}
+
+function normalizeYearMonthQuery(value: unknown): string | undefined {
+  const raw = stringField(value);
+  return /^\d{4}-\d{2}$/.test(raw) ? raw : undefined;
 }
 
 function numericField(value: unknown): number | undefined {
@@ -1029,7 +1080,19 @@ function errorCodeForStage(stage: string): string {
 }
 
 function parseOwnerType(value: unknown): OwnerType | null {
-  return value === "personal" || value === "business" || value === "mixed" ? value : null;
+  const raw = stringField(value);
+  const normalized = raw.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  const aliases: Record<string, OwnerType> = {
+    personal: "personal",
+    business: "business",
+    mixed: "mixed",
+    leandro: "Leandro",
+    johana: "Johana",
+    hogar: "Hogar",
+    negocio: "Negocio"
+  };
+
+  return aliases[normalized] ?? null;
 }
 
 function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {
