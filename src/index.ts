@@ -1,4 +1,28 @@
 import { Hono } from "hono";
+import { runParserSmokeTests } from "./lib/pdf-statements";
+import {
+  createBusinessReimbursement,
+  createCard,
+  createCardSummary,
+  createManualInstallment,
+  debugCardStatement,
+  deleteCard,
+  getCardsDashboard,
+  getCardStatement,
+  getInstallmentForecast,
+  initializeFinanceModuleSheets,
+  listBusinessReimbursements,
+  listCardSummaries,
+  listCards,
+  listInstallmentProjections,
+  listInstallments,
+  registerReimbursementPayment,
+  uploadCardStatementPdf,
+  updateBusinessReimbursement,
+  updateCard,
+  updateCardStatement,
+  updateInstallmentDetail
+} from "./lib/finance-modules";
 import {
   createTransaction,
   debugSheets,
@@ -8,6 +32,9 @@ import {
 } from "./lib/sheets";
 import type {
   AppErrorStep,
+  InstallmentFilters,
+  OwnerType,
+  ReimbursementStatus,
   CreateTransactionInput,
   Env,
   TransactionType,
@@ -130,6 +157,354 @@ app.get("/debug/sheets", async (c) => {
   }
 });
 
+app.post("/api/setup/modules", async (c) => {
+  const result = await initializeFinanceModuleSheets(c.env);
+  return c.json(result);
+});
+
+app.get("/api/cards", async (c) => {
+  const cards = await listCards(c.env);
+  return c.json(cards);
+});
+
+app.post("/api/cards", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const cardInput = validateCardPayload(payload, false);
+  if (!cardInput.ok) {
+    return c.json({ error: cardInput.error }, 400);
+  }
+
+  const card = await createCard(c.env, cardInput.value);
+  return c.json(card, 201);
+});
+
+app.patch("/api/cards/:id", async (c) => {
+  const payload = await safeJson(c);
+  const cardId = c.req.param("id").trim();
+
+  if (!payload || !cardId) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const cardInput = validateCardPayload(payload, true);
+  if (!cardInput.ok) {
+    return c.json({ error: cardInput.error }, 400);
+  }
+
+  const card = await updateCard(c.env, { ...cardInput.value, cardId });
+
+  if (!card) {
+    return c.json({ error: "Card not found." }, 404);
+  }
+
+  return c.json(card);
+});
+
+app.delete("/api/cards/:id", async (c) => {
+  const cardId = c.req.param("id").trim();
+
+  if (!cardId) {
+    return c.json({ error: "Card id is required." }, 400);
+  }
+
+  const deleted = await deleteCard(c.env, cardId);
+
+  if (!deleted) {
+    return c.json({ error: "Card not found." }, 404);
+  }
+
+  return c.json({ ok: true, cardId });
+});
+
+app.get("/api/card-statements", async (c) => {
+  const summaries = await listCardSummaries(c.env);
+  return c.json(summaries);
+});
+
+app.get("/api/card-statements/:id", async (c) => {
+  const summaryId = c.req.param("id").trim();
+  const summary = await getCardStatement(c.env, summaryId);
+
+  if (!summary) {
+    return c.json({ error: "Statement not found." }, 404);
+  }
+
+  return c.json(summary);
+});
+
+app.post("/api/card-statements/manual", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const statementInput = validateCardStatementPayload(payload, false);
+  if (!statementInput.ok) {
+    return c.json({ error: statementInput.error }, 400);
+  }
+
+  const summary = await createCardSummary(c.env, statementInput.value);
+  return c.json(summary, 201);
+});
+
+app.post("/api/card-statements/upload", async (c) => {
+  const formData = await c.req.formData();
+  const fileEntry = formData.get("file");
+
+  if (!(fileEntry instanceof File)) {
+    return c.json({ error: 'Field "file" must be a PDF file.' }, 400);
+  }
+
+  const fileName = fileEntry.name.trim();
+  const fileType = fileEntry.type.trim().toLowerCase();
+
+  if (!fileName.toLowerCase().endsWith(".pdf") && fileType !== "application/pdf") {
+    return c.json({ error: "Only PDF uploads are supported." }, 400);
+  }
+
+  const result = await uploadCardStatementPdf(c.env, {
+    fileName,
+    pdfBytes: await fileEntry.arrayBuffer(),
+    cardId: formDataString(formData.get("cardId")),
+    previewOnly: parseBooleanFlag(formData.get("previewOnly"))
+  });
+
+  return c.json(result, result.summary ? 201 : 200);
+});
+
+app.patch("/api/card-statements/:id", async (c) => {
+  const payload = await safeJson(c);
+  const summaryId = c.req.param("id").trim();
+
+  if (!payload || !summaryId) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const statementInput = validateCardStatementPayload(payload, true);
+  if (!statementInput.ok) {
+    return c.json({ error: statementInput.error }, 400);
+  }
+
+  const summary = await updateCardStatement(c.env, summaryId, statementInput.value);
+
+  if (!summary) {
+    return c.json({ error: "Statement not found." }, 404);
+  }
+
+  return c.json(summary);
+});
+
+app.get("/debug/card-statement/:id", async (c) => {
+  const summaryId = c.req.param("id").trim();
+
+  if (!summaryId) {
+    return c.json({ error: "Statement id is required." }, 400);
+  }
+
+  const result = await debugCardStatement(c.env, summaryId);
+
+  if (!result) {
+    return c.json({ error: "Statement not found." }, 404);
+  }
+
+  return c.json(result);
+});
+
+app.get("/debug/cards", async (c) => {
+  const cards = await listCards(c.env);
+  return c.json({
+    ok: true,
+    count: cards.length,
+    active: cards.filter((card) => card.active).length,
+    cards
+  });
+});
+
+app.get("/debug/statements", async (c) => {
+  const statements = await listCardSummaries(c.env);
+  const parserSmoke = runParserSmokeTests({
+    visaSantander:
+      "SANTANDER RIO VISA RESUMEN DE CUENTA TITULAR DE CUENTA: JUAN PEREZ CIERRE ACTUAL: 12 mar. 26 VENCIMIENTO ACTUAL: 25 mar. 26 SALDO ACTUAL: $ 515.721,14 PAGO MINIMO: $ 60.096,00 Cuotas a vencer Abril/26 123.456,78 Mayo/26 22.000,00",
+    visaBna:
+      "VISA PLATINUM BANCO NACION TITULAR DE CUENTA: MERCADO LEANDRO EZEQUIEL CIERRE ACTUAL: 12 mar. 26 VENCIMIENTO ACTUAL: 25 mar. 26 SALDO ACTUAL: $ 515.721,14 PAGO MINIMO: $ 60.096,00 Cuotas a vencer Abril/26 54.000,00 Mayo/26 43.210,00",
+    mastercardBna:
+      "MASTERCARD PLATINUM BANCO NACION Estado de cuenta al: 12-Mar-26 Vencimiento actual: 25-Mar-26 Saldo actual: $ 975.446,16 Pago Minimo: $ 112.510,00 Cuotas a vencer Abril-26 33.000,00 Mayo-26 22.000,00",
+    naranjaX:
+      "NARANJA X JOHANA LUCIANA ZAMUDIO Tu total a pagar es $608.101,95 y vence el 10/04/26. LA MENOR ENTREGA $351.900,00 El resumen actual cerro el 27/03. El proximo resumen cierra el 27/04, y vence el 10/05. Cuotas futuras Mayo/26 $187.257,30 Junio/26 $56.670,00"
+  });
+  return c.json({
+    ok: true,
+    count: statements.length,
+    parsedWithWarnings: statements.filter((statement) => statement.parseStatus === "parsed-with-warnings").length,
+    parserSmoke,
+    statements
+  });
+});
+
+app.get("/debug/installments", async (c) => {
+  const filters = getInstallmentFilters(c);
+  const installments = await listInstallments(c.env, filters);
+  const projections = await listInstallmentProjections(c.env);
+  const forecast = await getInstallmentForecast(c.env, filters);
+  return c.json({
+    ok: true,
+    filters,
+    installmentCount: installments.length,
+    projectionCount: projections.length,
+    forecast,
+    installments,
+    projections
+  });
+});
+
+app.get("/debug/reimbursements", async (c) => {
+  const reimbursements = await listBusinessReimbursements(c.env);
+  return c.json({
+    ok: true,
+    count: reimbursements.length,
+    pending: reimbursements.filter((item) => item.reimbursementStatus === "pending").length,
+    partial: reimbursements.filter((item) => item.reimbursementStatus === "partial").length,
+    paid: reimbursements.filter((item) => item.reimbursementStatus === "paid").length,
+    reimbursements
+  });
+});
+
+app.get("/api/installments/forecast", async (c) => {
+  const forecast = await getInstallmentForecast(c.env, getInstallmentFilters(c));
+  return c.json(forecast);
+});
+
+app.get("/api/installments", async (c) => {
+  const details = await listInstallments(c.env, getInstallmentFilters(c));
+  return c.json(details);
+});
+
+app.post("/api/installments/manual", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const installmentInput = validateInstallmentPayload(payload, false);
+  if (!installmentInput.ok) {
+    return c.json({ error: installmentInput.error }, 400);
+  }
+
+  const detail = await createManualInstallment(c.env, installmentInput.value);
+  return c.json(detail, 201);
+});
+
+app.patch("/api/installments/:id", async (c) => {
+  const payload = await safeJson(c);
+  const installmentId = c.req.param("id").trim();
+
+  if (!payload || !installmentId) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const installmentInput = validateInstallmentPayload(payload, true);
+  if (!installmentInput.ok) {
+    return c.json({ error: installmentInput.error }, 400);
+  }
+
+  const detail = await updateInstallmentDetail(c.env, { ...installmentInput.value, installmentId });
+
+  if (!detail) {
+    return c.json({ error: "Installment not found." }, 404);
+  }
+
+  return c.json(detail);
+});
+
+app.get("/api/reimbursements", async (c) => {
+  const reimbursements = await listBusinessReimbursements(c.env);
+  return c.json(reimbursements);
+});
+
+app.post("/api/reimbursements", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const reimbursementInput = validateReimbursementPayload(payload, false);
+  if (!reimbursementInput.ok) {
+    return c.json({ error: reimbursementInput.error }, 400);
+  }
+
+  const reimbursement = await createBusinessReimbursement(c.env, reimbursementInput.value);
+  return c.json(reimbursement, 201);
+});
+
+app.patch("/api/reimbursements/:id", async (c) => {
+  const payload = await safeJson(c);
+  const reimbursementId = c.req.param("id").trim();
+
+  if (!payload || !reimbursementId) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const reimbursementInput = validateReimbursementPayload(payload, true);
+  if (!reimbursementInput.ok) {
+    return c.json({ error: reimbursementInput.error }, 400);
+  }
+
+  const reimbursement = await updateBusinessReimbursement(c.env, {
+    ...reimbursementInput.value,
+    reimbursementId
+  });
+
+  if (!reimbursement) {
+    return c.json({ error: "Reimbursement not found." }, 404);
+  }
+
+  return c.json(reimbursement);
+});
+
+app.post("/api/reimbursements/register-payment", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const reimbursementId = stringField(payload.reimbursementId);
+  const paymentAmount = parseAmount(payload.paymentAmount);
+
+  if (!reimbursementId) {
+    return c.json({ error: 'Field "reimbursementId" is required.' }, 400);
+  }
+
+  if (paymentAmount === null || paymentAmount <= 0) {
+    return c.json({ error: 'Field "paymentAmount" must be a valid number greater than zero.' }, 400);
+  }
+
+  const reimbursement = await registerReimbursementPayment(c.env, {
+    reimbursementId,
+    paymentAmount,
+    reimbursedDate: dateField(payload.reimbursedDate)
+  });
+
+  if (!reimbursement) {
+    return c.json({ error: "Reimbursement not found." }, 404);
+  }
+
+  return c.json(reimbursement);
+});
+
+app.get("/api/cards/dashboard", async (c) => {
+  const dashboard = await getCardsDashboard(c.env);
+  return c.json(dashboard);
+});
+
 app.notFound(async (c) => {
   if (c.req.method === "GET" && !c.req.path.startsWith("/api/")) {
     return c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
@@ -236,11 +611,183 @@ function validateUpdateInput(
   return { ok: true, value };
 }
 
+function validateCardPayload(
+  payload: Record<string, unknown>,
+  partial: boolean
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  if (!partial && !stringField(payload.issuer)) {
+    return { ok: false, error: 'Field "issuer" is required.' };
+  }
+
+  if (!partial && !stringField(payload.holder)) {
+    return { ok: false, error: 'Field "holder" is required.' };
+  }
+
+  const value: Record<string, unknown> = {};
+  setIfPresent(value, payload, "issuer", stringField);
+  setIfPresent(value, payload, "brand", stringField);
+  setIfPresent(value, payload, "bank", stringField);
+  setIfPresent(value, payload, "holder", stringField);
+  setIfPresent(value, payload, "last4", stringField);
+  setIfPresent(value, payload, "closeDay", numericField);
+  setIfPresent(value, payload, "dueDay", numericField);
+  setIfPresent(value, payload, "active", booleanField);
+
+  return { ok: true, value };
+}
+
+function validateCardStatementPayload(
+  payload: Record<string, unknown>,
+  partial: boolean
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  if (!partial && !stringField(payload.cardId)) {
+    return { ok: false, error: 'Field "cardId" is required.' };
+  }
+
+  if (!partial && !dateField(payload.dueDate) && !dateField(payload.closingDate)) {
+    return { ok: false, error: 'Field "dueDate" or "closingDate" is required.' };
+  }
+
+  const value: Record<string, unknown> = {};
+  setIfPresent(value, payload, "cardId", stringField);
+  setIfPresent(value, payload, "issuer", stringField);
+  setIfPresent(value, payload, "brand", stringField);
+  setIfPresent(value, payload, "bank", stringField);
+  setIfPresent(value, payload, "holder", stringField);
+  setIfPresent(value, payload, "fileName", stringField);
+  setIfPresent(value, payload, "sourceType", stringField);
+  setIfPresent(value, payload, "statementDate", dateField);
+  setIfPresent(value, payload, "closingDate", dateField);
+  setIfPresent(value, payload, "dueDate", dateField);
+  setIfPresent(value, payload, "nextDueDate", dateField);
+  setIfPresent(value, payload, "totalAmount", numericField);
+  setIfPresent(value, payload, "minimumPayment", numericField);
+  setIfPresent(value, payload, "currency", stringField);
+  setIfPresent(value, payload, "rawText", stringField);
+  setIfPresent(value, payload, "rawDetectedData", rawJsonField);
+  setIfPresent(value, payload, "warnings", rawJsonField);
+  if ("parseStatus" in payload) {
+    value.parseStatus = stringField(payload.parseStatus) || "manual";
+  } else if (!partial) {
+    value.parseStatus = "manual";
+  }
+
+  return { ok: true, value };
+}
+
+function validateInstallmentPayload(
+  payload: Record<string, unknown>,
+  partial: boolean
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  const amount = numericField(payload.amount);
+  const ownerType = parseOwnerType(payload.ownerType);
+  const reimbursementStatus = parseReimbursementStatus(payload.reimbursementStatus);
+
+  if (!partial && !stringField(payload.merchant)) {
+    return { ok: false, error: 'Field "merchant" is required.' };
+  }
+
+  if (!partial && (!amount || amount <= 0)) {
+    return { ok: false, error: 'Field "amount" must be a valid number greater than zero.' };
+  }
+
+  if (!partial && !dateField(payload.dueDate)) {
+    return { ok: false, error: 'Field "dueDate" is required.' };
+  }
+
+  if ("ownerType" in payload && !ownerType) {
+    return { ok: false, error: 'Field "ownerType" must be "personal", "business" or "mixed".' };
+  }
+
+  if ("reimbursementStatus" in payload && !reimbursementStatus) {
+    return { ok: false, error: 'Field "reimbursementStatus" must be "pending", "partial" or "paid".' };
+  }
+
+  const value: Record<string, unknown> = {};
+  setIfPresent(value, payload, "summaryId", stringField);
+  setIfPresent(value, payload, "cardId", stringField);
+  setIfPresent(value, payload, "purchaseDate", dateField);
+  setIfPresent(value, payload, "merchant", stringField);
+  setIfPresent(value, payload, "installmentNumber", numericField);
+  setIfPresent(value, payload, "installmentTotal", numericField);
+  if ("amount" in payload) {
+    value.amount = amount;
+  }
+  setIfPresent(value, payload, "dueMonth", stringField);
+  setIfPresent(value, payload, "dueDate", dateField);
+  if ("ownerType" in payload) {
+    value.ownerType = ownerType ?? undefined;
+  }
+  setIfPresent(value, payload, "businessPercent", numericField);
+  setIfPresent(value, payload, "businessAmount", numericField);
+  setIfPresent(value, payload, "personalAmount", numericField);
+  if ("reimbursementStatus" in payload) {
+    value.reimbursementStatus = reimbursementStatus ?? undefined;
+  }
+  setIfPresent(value, payload, "notes", stringField);
+
+  return { ok: true, value };
+}
+
+function validateReimbursementPayload(
+  payload: Record<string, unknown>,
+  partial: boolean
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  const reimbursementStatus = parseReimbursementStatus(payload.reimbursementStatus);
+
+  if (!partial && !stringField(payload.concept)) {
+    return { ok: false, error: 'Field "concept" is required.' };
+  }
+
+  if ("reimbursementStatus" in payload && !reimbursementStatus) {
+    return { ok: false, error: 'Field "reimbursementStatus" must be "pending", "partial" or "paid".' };
+  }
+
+  const value: Record<string, unknown> = {};
+  setIfPresent(value, payload, "sourceType", stringField);
+  setIfPresent(value, payload, "sourceId", stringField);
+  setIfPresent(value, payload, "cardId", stringField);
+  setIfPresent(value, payload, "concept", stringField);
+  setIfPresent(value, payload, "totalPaid", numericField);
+  setIfPresent(value, payload, "businessAmount", numericField);
+  setIfPresent(value, payload, "personalAmount", numericField);
+  if ("reimbursementStatus" in payload) {
+    value.reimbursementStatus = reimbursementStatus ?? undefined;
+  }
+  setIfPresent(value, payload, "reimbursementDueDate", dateField);
+  setIfPresent(value, payload, "reimbursedAmount", numericField);
+  setIfPresent(value, payload, "reimbursedDate", dateField);
+  setIfPresent(value, payload, "notes", stringField);
+
+  return { ok: true, value };
+}
+
+function getInstallmentFilters(c: {
+  req: { query: (name: string) => string | undefined };
+}): InstallmentFilters {
+  const ownerType = parseOwnerType(c.req.query("ownerType"));
+  const reimbursementStatus = parseReimbursementStatus(c.req.query("reimbursementStatus"));
+
+  return {
+    cardId: stringField(c.req.query("cardId")),
+    ownerType: ownerType ?? undefined,
+    reimbursementStatus: reimbursementStatus ?? undefined
+  };
+}
+
 function parseTransactionType(value: unknown): TransactionType | null {
   return value === "income" || value === "expense" ? value : null;
 }
 
 function parseAmount(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "string" && value.trim() === "") {
+    return null;
+  }
+
   const amount = typeof value === "number" ? value : Number(String(value ?? "").trim());
   return Number.isFinite(amount) ? amount : null;
 }
@@ -250,7 +797,71 @@ function stringField(value: unknown): string {
 }
 
 function dateField(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : "";
+}
+
+function rawJsonField(value: unknown): unknown {
+  return value;
+}
+
+function numericField(value: unknown): number | undefined {
+  const parsed = parseAmount(value);
+  return parsed === null ? undefined : parsed;
+}
+
+function setIfPresent<T>(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+  key: string,
+  parser: (value: unknown) => T
+): void {
+  if (key in source) {
+    target[key] = parser(source[key]);
+  }
+}
+
+function booleanField(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    if (value.trim().toLowerCase() === "true") {
+      return true;
+    }
+
+    if (value.trim().toLowerCase() === "false") {
+      return false;
+    }
+  }
+
+  return undefined;
+}
+
+function formDataString(value: FormDataEntryValue | null): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function parseBooleanFlag(value: FormDataEntryValue | null): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+function parseOwnerType(value: unknown): OwnerType | null {
+  return value === "personal" || value === "business" || value === "mixed" ? value : null;
+}
+
+function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {
+  return value === "pending" || value === "partial" || value === "paid" ? value : null;
 }
 
 function toAppError(error: unknown, fallbackStep: AppErrorStep): AppError {
