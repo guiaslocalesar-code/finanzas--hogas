@@ -337,20 +337,28 @@ app.post("/api/card-statements/pay", async (c) => {
   }
 
   const createExpense = payload.createTransaction !== false;
-  const transaction = createExpense
-    ? await createTransaction(c.env, {
-      id: Date.now().toString(),
-      type: "expense",
-      amount,
-      category: "Tarjetas",
-      description: `Pago tarjeta ${summary.issuer || summary.bank || summary.summaryId}`,
-      date: paymentDate,
-      dueDate: "",
-      createdAt: new Date().toISOString()
-    })
-    : null;
+  let transaction = null;
+  let warning = null;
 
-  return c.json({ ok: true, summary, transaction });
+  if (createExpense) {
+    try {
+      transaction = await createTransaction(c.env, {
+        id: Date.now().toString(),
+        type: "expense",
+        amount,
+        category: "Tarjetas",
+        description: `Pago tarjeta ${summary.issuer || summary.bank || summary.summaryId}`,
+        date: paymentDate,
+        dueDate: "",
+        createdAt: new Date().toISOString()
+      });
+    } catch (error) {
+      warning = "El pago quedó registrado, pero no se pudo crear el egreso automático.";
+      console.error("[card-statements/pay] transaction-create-failed", error);
+    }
+  }
+
+  return c.json({ ok: true, summary, transaction, warning });
 });
 
 app.post("/debug/card-statements/upload-test", async (c) => {

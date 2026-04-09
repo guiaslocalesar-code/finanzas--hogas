@@ -309,7 +309,7 @@ async function sheetsRequest(
     url
   });
 
-  const response = await fetch(url, {
+  const response = await fetchSheetsWithRetry(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -329,6 +329,31 @@ async function sheetsRequest(
   }
 
   return response;
+}
+
+async function fetchSheetsWithRetry(url: string, init: RequestInit): Promise<Response> {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetch(url, init);
+
+    if (response.ok || !shouldRetrySheetsResponse(response.status) || attempt === maxAttempts) {
+      return response;
+    }
+
+    response.body?.cancel().catch(() => undefined);
+    await sleep(250 * attempt);
+  }
+
+  return fetch(url, init);
+}
+
+function shouldRetrySheetsResponse(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function findRowById(snapshot: SheetSnapshot, id: string): { row: string[]; index: number } | null {
