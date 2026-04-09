@@ -1,5 +1,5 @@
 import { getGoogleAccessToken } from "./google-auth";
-import { extractPdfText, parseDetectedStatement } from "./pdf-statements";
+import { detectIssuerFromText, extractPdfText, parseDetectedStatement } from "./pdf-statements";
 import {
   AppError,
   BUSINESS_REIMBURSEMENT_HEADERS,
@@ -14,6 +14,7 @@ import {
   INSTALLMENT_PROJECTION_SHEET_NAME,
   type AppErrorStep,
   type BusinessReimbursementRecord,
+  type CardStatementUploadDebugResult,
   type CardsDashboardResponse,
   type CardRecord,
   type CardSummaryImportResult,
@@ -261,82 +262,152 @@ export async function uploadCardStatementPdf(
     previewOnly?: boolean;
   }
 ): Promise<UploadedCardStatementResult> {
-  await initializeFinanceModuleSheets(env);
-
   const fileName = input.fileName.trim();
+  const cardId = input.cardId?.trim() ?? "";
+  logUploadStage("start", {
+    fileName,
+    cardId,
+    previewOnly: Boolean(input.previewOnly),
+    bytes: input.pdfBytes.byteLength
+  });
 
   if (!fileName) {
-    throw new AppError("parse", 'Field "fileName" is required.', undefined, 400);
+    throw new AppError("validate", 'Field "fileName" is required.', undefined, 400);
   }
 
   if (input.pdfBytes.byteLength === 0) {
-    throw new AppError("parse", "The uploaded PDF is empty.", undefined, 400);
+    throw new AppError("validate", "The uploaded PDF is empty.", undefined, 400);
   }
 
-  console.log("[card-statements/upload] extracting text", { fileName, bytes: input.pdfBytes.byteLength });
-  const rawText = await extractPdfText(input.pdfBytes);
-  console.log("[card-statements/upload] parsing issuer", { fileName, chars: rawText.length });
-  const preview = parseDetectedStatement(rawText, fileName);
+  const setupResult = await initializeFinanceModuleSheets(env);
+  logUploadStage("setup-complete", {
+    sheets: setupResult.sheets.map((sheet) => ({
+      sheetName: sheet.sheetName,
+      created: sheet.created,
+      headers: sheet.headers.length
+    }))
+  });
+
+  const analysis = await analyzeUploadedCardStatement(fileName, input.pdfBytes);
 
   if (input.previewOnly) {
+    logUploadStage("preview-return", {
+      fileName,
+      detectedIssuer: analysis.detectedIssuer,
+      warnings: analysis.preview.warnings.length,
+      textExtractedLength: analysis.textExtractedLength
+    });
     return {
       ok: true,
       fileName,
-      preview,
+      preview: analysis.preview,
       summary: null,
       projections: []
     };
   }
 
-  const cardId = input.cardId?.trim() ?? "";
   const card = cardId ? await getCardById(env, cardId) : null;
-  const dueDate = normalizeIsoDateValue(preview.dueDate) || guessDueDateFromCard(card, normalizeIsoDateValue(preview.closingDate));
-  const nextDueDate = normalizeIsoDateValue(preview.nextDueDate) || addMonthsToDateString(dueDate, 1);
-  console.log("[card-statements/upload] preview parsed", {
-    issuer: preview.issuer,
-    dueDate,
-    totalAmount: preview.totalAmount,
-    warnings: preview.warnings.length
-  });
+  if (cardId && !card) {
+    throw new AppError("validate", `Card "${cardId}" was not found.`, undefined, 400);
+  }
 
-  const summary = await createCardSummary(env, {
-    cardId,
-    issuer: preview.issuer || card?.issuer || "",
-    brand: preview.brand || card?.brand || "",
-    bank: preview.bank || card?.bank || "",
-    holder: preview.holder || card?.holder || "",
+  const dueDate =
+    normalizeIsoDateValue(analysis.preview.dueDate) ||
+    guessDueDateFromCard(card, normalizeIsoDateValue(analysis.preview.closingDate));
+  const nextDueDate =
+    normalizeIsoDateValue(analysis.preview.nextDueDate) || addMonthsToDateString(dueDate, 1);
+
+  if (!analysis.canSave) {
+    throw new AppError(
+      "parse-pdf",
+      "No se pudo extraer suficiente información del PDF para guardarlo.",
+      JSON.stringify({
+        warnings: analysis.preview.warnings,
+        detectedIssuer: analysis.detectedIssuer,
+        textExtractedLength: analysis.textExtractedLength
+      }),
+      400
+    );
+  }
+
+  logUploadStage("save-summary-start", {
     fileName,
-    sourceType: "pdf-upload",
-    statementDate: preview.closingDate || dueDate,
-    closingDate: preview.closingDate,
+    cardId,
     dueDate,
     nextDueDate,
-    totalAmount: preview.totalAmount,
-    minimumPayment: preview.minimumPayment,
-    currency: "ARS",
-    rawText,
-    rawDetectedData: preview.rawDetectedData,
-    warnings: preview.warnings,
-    parseStatus: preview.warnings.length > 0 ? "parsed-with-warnings" : "parsed"
+    detectedIssuer: analysis.detectedIssuer,
+    warnings: analysis.preview.warnings.length
   });
 
-  const projectionSnapshot = await readModuleSheet(
+  const summarySheet = await readModuleSheet(env, CARD_SUMMARY_SHEET_NAME, CARD_SUMMARY_HEADERS);
+  const projectionSheet = await readModuleSheet(
     env,
     INSTALLMENT_PROJECTION_SHEET_NAME,
     INSTALLMENT_PROJECTION_HEADERS
   );
-  const projections = buildProjectionRecordsFromPreview(summary, preview);
+
+  const summary = await appendCardSummaryFromUpload(env, summarySheet.headers, {
+    cardId,
+    card,
+    fileName,
+    rawText: analysis.rawText,
+    preview: analysis.preview,
+    dueDate,
+    nextDueDate
+  });
+
+  const projections = buildProjectionRecordsFromPreview(summary, analysis.preview);
 
   if (projections.length > 0) {
-    await appendRows(env, INSTALLMENT_PROJECTION_SHEET_NAME, projectionSnapshot.headers, projections);
+    logUploadStage("save-projections-start", {
+      summaryId: summary.summaryId,
+      count: projections.length
+    });
+    await appendRows(env, INSTALLMENT_PROJECTION_SHEET_NAME, projectionSheet.headers, projections);
   }
+
+  logUploadStage("save-complete", {
+    fileName,
+    summaryId: summary.summaryId,
+    projections: projections.length
+  });
 
   return {
     ok: true,
     fileName,
-    preview,
+    preview: analysis.preview,
     summary,
     projections
+  };
+}
+
+export async function debugUploadCardStatementPdf(
+  env: Env,
+  input: {
+    fileName: string;
+    mimeType: string;
+    pdfBytes: ArrayBuffer;
+    cardId?: string;
+  }
+): Promise<CardStatementUploadDebugResult> {
+  const setupResult = await initializeFinanceModuleSheets(env);
+  logUploadStage("debug-setup-complete", {
+    fileName: input.fileName,
+    sheetsReady: setupResult.sheets.length
+  });
+
+  const analysis = await analyzeUploadedCardStatement(input.fileName, input.pdfBytes);
+
+  return {
+    ok: true,
+    fileName: input.fileName.trim(),
+    mimeType: input.mimeType.trim(),
+    size: input.pdfBytes.byteLength,
+    textExtractedLength: analysis.textExtractedLength,
+    detectedIssuer: analysis.detectedIssuer,
+    parseWarnings: analysis.preview.warnings,
+    saveAttempted: false,
+    preview: analysis.preview
   };
 }
 
@@ -373,6 +444,148 @@ export async function debugCardStatement(env: Env, summaryId: string): Promise<D
     projections,
     parsed
   };
+}
+
+async function analyzeUploadedCardStatement(
+  fileName: string,
+  pdfBytes: ArrayBuffer
+): Promise<{
+  rawText: string;
+  preview: ParsedCardStatementPreview;
+  detectedIssuer: string;
+  textExtractedLength: number;
+  canSave: boolean;
+}> {
+  let rawText = "";
+  let detectedIssuer = "unknown";
+
+  logUploadStage("extract-text-start", { fileName, bytes: pdfBytes.byteLength });
+  try {
+    rawText = await extractPdfText(pdfBytes);
+    logUploadStage("extract-text-success", { fileName, chars: rawText.length });
+  } catch (error) {
+    const appError = error instanceof AppError ? error : new AppError("parse-pdf", "No se pudo extraer texto del PDF.", String(error), 400);
+    logUploadStage("extract-text-failed", {
+      fileName,
+      error: appError.message,
+      details: appError.details ?? ""
+    });
+    return {
+      rawText: "",
+      detectedIssuer: "unknown",
+      textExtractedLength: 0,
+      preview: buildPdfFallbackPreview(fileName, appError.message),
+      canSave: false
+    };
+  }
+
+  try {
+    detectedIssuer = detectIssuerFromText(rawText, fileName);
+    logUploadStage("detect-issuer-success", { fileName, detectedIssuer });
+  } catch (error) {
+    const appError = error instanceof AppError ? error : new AppError("detect-issuer", "No se pudo detectar el emisor.", String(error), 400);
+    logUploadStage("detect-issuer-warning", {
+      fileName,
+      error: appError.message
+    });
+  }
+
+  let preview: ParsedCardStatementPreview;
+  try {
+    preview = parseDetectedStatement(rawText, fileName);
+    logUploadStage("parse-success", {
+      fileName,
+      detectedIssuer,
+      warnings: preview.warnings.length,
+      dueDate: preview.dueDate,
+      totalAmount: preview.totalAmount
+    });
+  } catch (error) {
+    const appError = error instanceof AppError ? error : new AppError("parse", "No se pudo parsear el PDF.", String(error), 400);
+    logUploadStage("parse-failed", {
+      fileName,
+      error: appError.message,
+      details: appError.details ?? ""
+    });
+    preview = buildPdfFallbackPreview(fileName, appError.message);
+  }
+
+  return {
+    rawText,
+    preview,
+    detectedIssuer,
+    textExtractedLength: rawText.length,
+    canSave: Boolean(preview.dueDate || preview.totalAmount > 0 || preview.projections.length > 0)
+  };
+}
+
+async function appendCardSummaryFromUpload(
+  env: Env,
+  headers: string[],
+  input: {
+    cardId: string;
+    card: CardRecord | null;
+    fileName: string;
+    rawText: string;
+    preview: ParsedCardStatementPreview;
+    dueDate: string;
+    nextDueDate: string;
+  }
+): Promise<CardSummaryRecord> {
+  const record: CardSummaryRecord = {
+    summaryId: generateId("summary"),
+    cardId: input.cardId,
+    issuer: input.preview.issuer || input.card?.issuer || "",
+    brand: input.preview.brand || input.card?.brand || "",
+    bank: input.preview.bank || input.card?.bank || "",
+    holder: input.preview.holder || input.card?.holder || "",
+    fileName: input.fileName,
+    sourceType: "pdf-upload",
+    statementDate: input.preview.closingDate || input.dueDate,
+    closingDate: input.preview.closingDate,
+    dueDate: input.dueDate,
+    nextDueDate: input.nextDueDate,
+    totalAmount: input.preview.totalAmount,
+    minimumPayment: input.preview.minimumPayment,
+    currency: "ARS",
+    rawText: input.rawText,
+    rawDetectedData: stringifyJsonField(input.preview.rawDetectedData),
+    warnings: stringifyJsonField(input.preview.warnings),
+    parseStatus: input.preview.warnings.length > 0 ? "parsed-with-warnings" : "parsed",
+    createdAt: new Date().toISOString()
+  };
+
+  await appendRow(env, CARD_SUMMARY_SHEET_NAME, headers, record);
+  return record;
+}
+
+function buildPdfFallbackPreview(fileName: string, message: string): ParsedCardStatementPreview {
+  return {
+    issuer: "Desconocido",
+    brand: "",
+    bank: "",
+    holder: "",
+    closingDate: "",
+    dueDate: "",
+    nextDueDate: "",
+    totalAmount: 0,
+    minimumPayment: 0,
+    projections: [],
+    rawDetectedData: {
+      parser: "fallback",
+      fileName,
+      failure: message
+    },
+    warnings: [
+      "No se pudo parsear automáticamente este PDF.",
+      message,
+      "Podés continuar con la carga manual."
+    ]
+  };
+}
+
+function logUploadStage(stage: string, payload: Record<string, unknown>): void {
+  console.log("[card-statements/upload]", JSON.stringify({ stage, ...payload }));
 }
 
 export async function importCardSummaryFromText(

@@ -61,7 +61,7 @@ export async function extractPdfText(pdfBytes: ArrayBuffer): Promise<string> {
   const result = normalizeExtractedText(chunks.join("\n"));
 
   if (!result.trim()) {
-    throw new AppError("parse", "No readable text could be extracted from the uploaded PDF.");
+    throw new AppError("parse-pdf", "No readable text could be extracted from the uploaded PDF.", undefined, 400);
   }
 
   return result;
@@ -91,7 +91,7 @@ export function detectIssuerFromText(text: string, fileName = ""):
     return "naranja-x";
   }
 
-  throw new AppError("parse", "The uploaded PDF issuer could not be detected.", undefined, 400);
+    throw new AppError("detect-issuer", "The uploaded PDF issuer could not be detected.", undefined, 400);
 }
 
 export function parseVisaSantanderStatement(text: string): ParsedCardStatementPreview {
@@ -432,7 +432,7 @@ function parseEncryption(source: string): PdfEncryption | null {
 
 function decryptPdfObjectStream(streamBytes: Uint8Array, objectNumber: number, encryption: PdfEncryption): Uint8Array {
   if (encryption.version !== 2 || encryption.revision !== 3) {
-    throw new AppError("parse", "The uploaded encrypted PDF uses an unsupported security version.");
+    throw new AppError("parse-pdf", "The uploaded encrypted PDF uses an unsupported security version.", undefined, 400);
   }
 
   const fileKey = computePdfFileEncryptionKey(encryption);

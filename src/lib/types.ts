@@ -109,9 +109,13 @@ export type AppErrorStep =
   | "env"
   | "jwt"
   | "google-token"
+  | "form-data"
+  | "validate"
   | "sheet-read"
   | "sheet-write"
   | "sheet-delete"
+  | "parse-pdf"
+  | "detect-issuer"
   | "parse"
   | "setup";
 
@@ -346,6 +350,18 @@ export interface UploadedCardStatementResult {
   preview: ParsedCardStatementPreview;
   summary: CardSummaryRecord | null;
   projections: InstallmentProjectionRecord[];
+}
+
+export interface CardStatementUploadDebugResult {
+  ok: true;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  textExtractedLength: number;
+  detectedIssuer: string;
+  parseWarnings: string[];
+  saveAttempted: boolean;
+  preview: ParsedCardStatementPreview | null;
 }
 
 export interface DebugCardStatementResult {

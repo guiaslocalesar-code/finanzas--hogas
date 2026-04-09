@@ -6,6 +6,7 @@ import {
   createCardSummary,
   createManualInstallment,
   debugCardStatement,
+  debugUploadCardStatementPdf,
   deleteCard,
   getCardsDashboard,
   getCardStatement,
@@ -254,28 +255,39 @@ app.post("/api/card-statements/manual", async (c) => {
 });
 
 app.post("/api/card-statements/upload", async (c) => {
-  const formData = await c.req.formData();
-  const fileEntry = formData.get("file");
+  console.log("[card-statements/upload]", JSON.stringify({ stage: "endpoint-enter" }));
 
-  if (!(fileEntry instanceof File)) {
-    return c.json({ error: 'Field "file" must be a PDF file.' }, 400);
+  try {
+    const uploadInput = await parseCardStatementUploadRequest(c);
+    console.log(
+      "[card-statements/upload]",
+      JSON.stringify({
+        stage: "request-validated",
+        fileName: uploadInput.fileName,
+        mimeType: uploadInput.mimeType,
+        size: uploadInput.pdfBytes.byteLength,
+        cardId: uploadInput.cardId,
+        previewOnly: uploadInput.previewOnly
+      })
+    );
+
+    const result = await uploadCardStatementPdf(c.env, uploadInput);
+    return c.json(result, result.summary ? 201 : 200);
+  } catch (error) {
+    return c.json(buildUploadErrorResponse(error, "parse-pdf"), getErrorStatus(error));
   }
+});
 
-  const fileName = fileEntry.name.trim();
-  const fileType = fileEntry.type.trim().toLowerCase();
+app.post("/debug/card-statements/upload-test", async (c) => {
+  console.log("[card-statements/upload-test]", JSON.stringify({ stage: "endpoint-enter" }));
 
-  if (!fileName.toLowerCase().endsWith(".pdf") && fileType !== "application/pdf") {
-    return c.json({ error: "Only PDF uploads are supported." }, 400);
+  try {
+    const uploadInput = await parseCardStatementUploadRequest(c);
+    const result = await debugUploadCardStatementPdf(c.env, uploadInput);
+    return c.json(result);
+  } catch (error) {
+    return c.json(buildUploadErrorResponse(error, "parse-pdf"), getErrorStatus(error));
   }
-
-  const result = await uploadCardStatementPdf(c.env, {
-    fileName,
-    pdfBytes: await fileEntry.arrayBuffer(),
-    cardId: formDataString(formData.get("cardId")),
-    previewOnly: parseBooleanFlag(formData.get("previewOnly"))
-  });
-
-  return c.json(result, result.summary ? 201 : 200);
 });
 
 app.patch("/api/card-statements/:id", async (c) => {
@@ -854,6 +866,134 @@ function parseBooleanFlag(value: FormDataEntryValue | null): boolean {
 
   const normalized = value.trim().toLowerCase();
   return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+async function parseCardStatementUploadRequest(c: {
+  req: { formData: () => Promise<FormData> };
+}): Promise<{
+  fileName: string;
+  mimeType: string;
+  pdfBytes: ArrayBuffer;
+  cardId: string;
+  previewOnly: boolean;
+}> {
+  let formData: FormData;
+
+  try {
+    formData = await c.req.formData();
+    console.log("[card-statements/upload]", JSON.stringify({ stage: "form-data-read" }));
+  } catch (error) {
+    throw new AppError("form-data", "No se pudo leer multipart/form-data.", String(error), 400);
+  }
+
+  const fileEntry = formData.get("file") ?? formData.get("pdf");
+  const cardId = formDataString(formData.get("cardId"));
+  const previewOnly = parseBooleanFlag(formData.get("previewOnly"));
+
+  console.log(
+    "[card-statements/upload]",
+    JSON.stringify({
+      stage: "form-data-fields",
+      fileFieldFound: Boolean(fileEntry),
+      cardId,
+      previewOnly
+    })
+  );
+
+  if (!(fileEntry instanceof File)) {
+    throw new AppError("validate", 'Field "file" is required and must be a PDF file.', undefined, 400);
+  }
+
+  const fileName = fileEntry.name.trim();
+  const mimeType = fileEntry.type.trim().toLowerCase();
+
+  if (!fileName) {
+    throw new AppError("validate", "The uploaded file must include a file name.", undefined, 400);
+  }
+
+  if (!fileName.toLowerCase().endsWith(".pdf") && mimeType !== "application/pdf") {
+    throw new AppError("validate", "Only PDF uploads are supported.", JSON.stringify({ fileName, mimeType }), 400);
+  }
+
+  if (fileEntry.size <= 0) {
+    throw new AppError("validate", "The uploaded PDF is empty.", JSON.stringify({ fileName, mimeType }), 400);
+  }
+
+  let pdfBytes: ArrayBuffer;
+  try {
+    pdfBytes = await fileEntry.arrayBuffer();
+    console.log(
+      "[card-statements/upload]",
+      JSON.stringify({
+        stage: "file-bytes-read",
+        fileName,
+        mimeType,
+        size: pdfBytes.byteLength
+      })
+    );
+  } catch (error) {
+    throw new AppError("parse-pdf", "No se pudieron leer los bytes del PDF.", String(error), 400);
+  }
+
+  if (pdfBytes.byteLength === 0) {
+    throw new AppError("validate", "The uploaded PDF is empty.", JSON.stringify({ fileName, mimeType }), 400);
+  }
+
+  return {
+    fileName,
+    mimeType,
+    pdfBytes,
+    cardId,
+    previewOnly
+  };
+}
+
+function buildUploadErrorResponse(error: unknown, fallbackStage: AppErrorStep) {
+  const appError = toAppError(error, fallbackStage);
+  let details: unknown = appError.details ?? null;
+
+  if (typeof details === "string") {
+    try {
+      details = JSON.parse(details);
+    } catch {
+      details = details || null;
+    }
+  }
+
+  return {
+    ok: false,
+    stage: appError.step,
+    error: errorCodeForStage(appError.step),
+    message: appError.message,
+    details
+  };
+}
+
+function getErrorStatus(error: unknown): 400 | 404 | 500 {
+  if (error instanceof AppError) {
+    return error.status === 404 ? 404 : error.status === 400 ? 400 : 500;
+  }
+
+  return 500;
+}
+
+function errorCodeForStage(stage: string): string {
+  switch (stage) {
+    case "form-data":
+      return "FORM_DATA_INVALID";
+    case "validate":
+      return "UPLOAD_VALIDATION_FAILED";
+    case "parse-pdf":
+      return "PDF_PARSE_FAILED";
+    case "detect-issuer":
+      return "PDF_ISSUER_NOT_DETECTED";
+    case "sheet-write":
+      return "SHEET_SAVE_FAILED";
+    case "setup":
+      return "SHEET_SETUP_FAILED";
+    default:
+      return "UPLOAD_FAILED";
+  }
 }
 
 function parseOwnerType(value: unknown): OwnerType | null {
