@@ -21,7 +21,11 @@ Estructura JSON obligatoria a devolver:
     "dueDate": string | null (YYYY-MM-DD),
     "nextDueDate": string | null (YYYY-MM-DD),
     "totalAmount": number | null,
-    "minimumPayment": number | null
+    "totalAmountARS": number | null,
+    "totalAmountUSD": number | null,
+    "minimumPayment": number | null,
+    "minimumPaymentARS": number | null,
+    "minimumPaymentUSD": number | null
   },
   "projections": [
     {
@@ -37,6 +41,7 @@ Estructura JSON obligatoria a devolver:
       "installmentNumber": number,
       "installmentTotal": number,
       "amount": number (solo el monto de esta cuota, sin $),
+      "currency": "ARS" | "USD",
       "remainingInstallments": number | null
     }
   ]
@@ -54,6 +59,7 @@ type GeminiInstallment = {
   installmentNumber?: number | string | null;
   installmentTotal?: number | string | null;
   amount?: number | string | null;
+  currency?: string | null;
   remainingInstallments?: number | string | null;
 };
 
@@ -64,7 +70,11 @@ type GeminiStatementSummary = {
   dueDate?: string | null;
   nextDueDate?: string | null;
   totalAmount?: number | string | null;
+  totalAmountARS?: number | string | null;
+  totalAmountUSD?: number | string | null;
   minimumPayment?: number | string | null;
+  minimumPaymentARS?: number | string | null;
+  minimumPaymentUSD?: number | string | null;
 };
 
 type GeminiStatementPayload = GeminiStatementSummary & {
@@ -219,6 +229,7 @@ function normalizeGeminiStatement(parsed: GeminiStatementPayload): ParsedCardSta
             installmentNumber,
             installmentTotal,
             amount: currencyNumber(item.amount),
+            currency: normalizeCurrency(item.currency),
             remainingInstallments: Math.max(
               integerNumber(item.remainingInstallments),
               installmentTotal - installmentNumber,
@@ -237,8 +248,12 @@ function normalizeGeminiStatement(parsed: GeminiStatementPayload): ParsedCardSta
     closingDate: isoDateOrEmpty(summary.closingDate),
     dueDate: isoDateOrEmpty(summary.dueDate),
     nextDueDate: isoDateOrEmpty(summary.nextDueDate),
-    totalAmount: currencyNumber(summary.totalAmount),
-    minimumPayment: currencyNumber(summary.minimumPayment),
+    totalAmount: currencyNumber(summary.totalAmountARS) || currencyNumber(summary.totalAmount),
+    totalAmountARS: currencyNumber(summary.totalAmountARS) || currencyNumber(summary.totalAmount),
+    totalAmountUSD: currencyNumber(summary.totalAmountUSD),
+    minimumPayment: currencyNumber(summary.minimumPaymentARS) || currencyNumber(summary.minimumPayment),
+    minimumPaymentARS: currencyNumber(summary.minimumPaymentARS) || currencyNumber(summary.minimumPayment),
+    minimumPaymentUSD: currencyNumber(summary.minimumPaymentUSD),
     projections,
     installmentsDetail,
     rawDetectedData: {
@@ -326,4 +341,8 @@ function currencyNumber(value: unknown): number {
   }
 
   return 0;
+}
+
+function normalizeCurrency(value: unknown): "ARS" | "USD" {
+  return stringOrEmpty(value).toUpperCase() === "USD" ? "USD" : "ARS";
 }

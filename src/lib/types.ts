@@ -39,6 +39,10 @@ export const CARD_SUMMARY_HEADERS = [
   "closingDate",
   "dueDate",
   "nextDueDate",
+  "totalAmountARS",
+  "totalAmountUSD",
+  "minimumPaymentARS",
+  "minimumPaymentUSD",
   "totalAmount",
   "minimumPayment",
   "currency",
@@ -75,6 +79,7 @@ export const INSTALLMENT_DETAIL_HEADERS = [
   "installmentNumber",
   "installmentTotal",
   "amount",
+  "currency",
   "dueMonth",
   "dueDate",
   "ownerType",
@@ -83,6 +88,30 @@ export const INSTALLMENT_DETAIL_HEADERS = [
   "personalAmount",
   "reimbursementStatus",
   "notes",
+  "createdAt"
+] as const;
+
+export const ACCOUNTS_PAYABLE_SHEET_NAME = "CuentasPorPagar";
+export const ACCOUNTS_PAYABLE_HEADERS = [
+  "id",
+  "description",
+  "amount",
+  "currency",
+  "dueDate",
+  "paidAmount",
+  "status",
+  "ownerType",
+  "createdBy",
+  "createdAt"
+] as const;
+
+export const BUDGET_SHEET_NAME = "Presupuestos";
+export const BUDGET_HEADERS = [
+  "id",
+  "category",
+  "monthlyLimit",
+  "monthYear",
+  "ownerType",
   "createdAt"
 ] as const;
 
@@ -107,6 +136,8 @@ export const BUSINESS_REIMBURSEMENT_HEADERS = [
 export type TransactionType = "income" | "expense";
 export type OwnerType = "personal" | "business" | "mixed" | "Leandro" | "Johana" | "Hogar" | "Negocio";
 export type ReimbursementStatus = "pending" | "partial" | "paid";
+export type CurrencyCode = "ARS" | "USD";
+export type PayableStatus = "PENDING" | "PARTIAL" | "PAID";
 export type AppErrorStep =
   | "env"
   | "jwt"
@@ -191,6 +222,10 @@ export interface CardSummaryRecord extends Record<string, string | number | bool
   closingDate: string;
   dueDate: string;
   nextDueDate: string;
+  totalAmountARS: number;
+  totalAmountUSD: number;
+  minimumPaymentARS: number;
+  minimumPaymentUSD: number;
   totalAmount: number;
   minimumPayment: number;
   currency: string;
@@ -225,6 +260,7 @@ export interface InstallmentDetailRecord extends Record<string, string | number 
   installmentNumber: number;
   installmentTotal: number;
   amount: number;
+  currency: CurrencyCode;
   dueMonth: string;
   dueDate: string;
   ownerType: OwnerType;
@@ -234,6 +270,41 @@ export interface InstallmentDetailRecord extends Record<string, string | number 
   reimbursementStatus: ReimbursementStatus;
   notes: string;
   createdAt: string;
+}
+
+export interface AccountPayableRecord extends Record<string, string | number | boolean> {
+  id: string;
+  description: string;
+  amount: number;
+  currency: CurrencyCode;
+  dueDate: string;
+  paidAmount: number;
+  status: PayableStatus;
+  ownerType: OwnerType;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface BudgetRecord extends Record<string, string | number | boolean> {
+  id: string;
+  category: string;
+  monthlyLimit: number;
+  monthYear: string;
+  ownerType: OwnerType;
+  createdAt: string;
+}
+
+export interface BudgetSummaryItem {
+  budget: BudgetRecord;
+  spent: number;
+  available: number;
+  percentUsed: number;
+  exceeded: boolean;
+}
+
+export interface BudgetSummaryResponse {
+  monthYear: string;
+  items: BudgetSummaryItem[];
 }
 
 export interface BusinessReimbursementRecord extends Record<string, string | number | boolean> {
@@ -362,6 +433,7 @@ export interface CardStatementInstallmentPreview {
   installmentNumber: number;
   installmentTotal: number;
   amount: number;
+  currency?: CurrencyCode;
   remainingInstallments: number;
 }
 
@@ -374,7 +446,11 @@ export interface ParsedCardStatementPreview {
   dueDate: string;
   nextDueDate: string;
   totalAmount: number;
+  totalAmountARS?: number;
+  totalAmountUSD?: number;
   minimumPayment: number;
+  minimumPaymentARS?: number;
+  minimumPaymentUSD?: number;
   projections: CardStatementProjectionPreview[];
   installmentsDetail: CardStatementInstallmentPreview[];
   rawDetectedData: Record<string, unknown>;

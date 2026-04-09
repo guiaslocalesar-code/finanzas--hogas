@@ -2,7 +2,11 @@ import { getGoogleAccessToken } from "./google-auth";
 import { parseNaranjaWithGemini } from "./gemini";
 import { detectIssuerFromText, extractPdfText, parseDetectedStatement } from "./pdf-statements";
 import {
+  ACCOUNTS_PAYABLE_HEADERS,
+  ACCOUNTS_PAYABLE_SHEET_NAME,
   AppError,
+  BUDGET_HEADERS,
+  BUDGET_SHEET_NAME,
   BUSINESS_REIMBURSEMENT_HEADERS,
   BUSINESS_REIMBURSEMENT_SHEET_NAME,
   CARD_HEADERS,
@@ -14,6 +18,9 @@ import {
   INSTALLMENT_PROJECTION_HEADERS,
   INSTALLMENT_PROJECTION_SHEET_NAME,
   type AppErrorStep,
+  type AccountPayableRecord,
+  type BudgetRecord,
+  type BudgetSummaryResponse,
   type BusinessReimbursementRecord,
   type CardStatementUploadDebugResult,
   type CardStatementDetailResult,
@@ -34,9 +41,11 @@ import {
   type InstallmentProjectionRecord,
   type ModuleSheetSetupStatus,
   type OwnerType,
+  type PayableStatus,
   type ParsedCardStatementPreview,
   type ReimbursementStatus,
   type SheetSnapshot,
+  type TransactionRecord,
   type UploadedCardStatementResult
 } from "./types";
 
@@ -70,7 +79,9 @@ const MODULE_SHEETS: ModuleSheetConfig[] = [
   { sheetName: CARD_SUMMARY_SHEET_NAME, headers: CARD_SUMMARY_HEADERS },
   { sheetName: INSTALLMENT_PROJECTION_SHEET_NAME, headers: INSTALLMENT_PROJECTION_HEADERS },
   { sheetName: INSTALLMENT_DETAIL_SHEET_NAME, headers: INSTALLMENT_DETAIL_HEADERS },
-  { sheetName: BUSINESS_REIMBURSEMENT_SHEET_NAME, headers: BUSINESS_REIMBURSEMENT_HEADERS }
+  { sheetName: BUSINESS_REIMBURSEMENT_SHEET_NAME, headers: BUSINESS_REIMBURSEMENT_HEADERS },
+  { sheetName: ACCOUNTS_PAYABLE_SHEET_NAME, headers: ACCOUNTS_PAYABLE_HEADERS },
+  { sheetName: BUDGET_SHEET_NAME, headers: BUDGET_HEADERS }
 ];
 
 export async function initializeFinanceModuleSheets(env: Env): Promise<FinanceModuleSetupResult> {
@@ -190,8 +201,12 @@ export async function createCardSummary(env: Env, input: Record<string, unknown>
     closingDate,
     dueDate,
     nextDueDate,
-    totalAmount: numberValue(input.totalAmount),
-    minimumPayment: numberValue(input.minimumPayment),
+    totalAmountARS: numberValue(input.totalAmountARS) || numberValue(input.totalAmount),
+    totalAmountUSD: numberValue(input.totalAmountUSD),
+    minimumPaymentARS: numberValue(input.minimumPaymentARS) || numberValue(input.minimumPayment),
+    minimumPaymentUSD: numberValue(input.minimumPaymentUSD),
+    totalAmount: numberValue(input.totalAmountARS) || numberValue(input.totalAmount),
+    minimumPayment: numberValue(input.minimumPaymentARS) || numberValue(input.minimumPayment),
     currency: stringValue(input.currency) || "ARS",
     rawText: stringValue(input.rawText),
     rawDetectedData: stringifyJsonField(input.rawDetectedData),
@@ -681,8 +696,12 @@ async function appendCardSummaryFromUpload(
     closingDate: input.preview.closingDate,
     dueDate: input.dueDate,
     nextDueDate: input.nextDueDate,
-    totalAmount: input.preview.totalAmount,
-    minimumPayment: input.preview.minimumPayment,
+    totalAmountARS: numberValue(input.preview.totalAmountARS) || input.preview.totalAmount,
+    totalAmountUSD: numberValue(input.preview.totalAmountUSD),
+    minimumPaymentARS: numberValue(input.preview.minimumPaymentARS) || input.preview.minimumPayment,
+    minimumPaymentUSD: numberValue(input.preview.minimumPaymentUSD),
+    totalAmount: numberValue(input.preview.totalAmountARS) || input.preview.totalAmount,
+    minimumPayment: numberValue(input.preview.minimumPaymentARS) || input.preview.minimumPayment,
     currency: "ARS",
     rawText: input.rawText,
     rawDetectedData: stringifyJsonField(input.preview.rawDetectedData),
@@ -952,6 +971,7 @@ export async function createManualInstallment(
     installmentNumber: positiveInteger(input.installmentNumber, 1),
     installmentTotal: positiveInteger(input.installmentTotal, 1),
     amount,
+    currency: normalizeCurrency(input.currency),
     dueMonth,
     dueDate,
     ownerType,
@@ -1200,6 +1220,127 @@ export async function registerReimbursementPayment(
     reimbursedAmount: updatedReimbursedAmount,
     reimbursedDate: stringValue(input.reimbursedDate) || new Date().toISOString().slice(0, 10)
   });
+}
+
+export async function listAccountsPayable(env: Env): Promise<AccountPayableRecord[]> {
+  const snapshot = await readModuleSheet(env, ACCOUNTS_PAYABLE_SHEET_NAME, ACCOUNTS_PAYABLE_HEADERS);
+  return snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToAccountPayable(snapshot.headers, row))
+    .sort((left, right) => left.dueDate.localeCompare(right.dueDate));
+}
+
+export async function createAccountPayable(env: Env, input: Record<string, unknown>): Promise<AccountPayableRecord> {
+  const snapshot = await readModuleSheet(env, ACCOUNTS_PAYABLE_SHEET_NAME, ACCOUNTS_PAYABLE_HEADERS);
+  const amount = numberValue(input.amount);
+  const paidAmount = numberValue(input.paidAmount);
+  const record: AccountPayableRecord = {
+    id: generateId("ap"),
+    description: stringValue(input.description),
+    amount,
+    currency: normalizeCurrency(input.currency),
+    dueDate: stringValue(input.dueDate),
+    paidAmount,
+    status: normalizePayableStatus(input.status, paidAmount, amount),
+    ownerType: parseOwnerType(input.ownerType) ?? "Hogar",
+    createdBy: stringValue(input.createdBy) || "worker",
+    createdAt: new Date().toISOString()
+  };
+
+  await appendRow(env, ACCOUNTS_PAYABLE_SHEET_NAME, snapshot.headers, record);
+  return record;
+}
+
+export async function updateAccountPayable(
+  env: Env,
+  id: string,
+  input: Record<string, unknown>
+): Promise<AccountPayableRecord | null> {
+  const snapshot = await readModuleSheet(env, ACCOUNTS_PAYABLE_SHEET_NAME, ACCOUNTS_PAYABLE_HEADERS);
+  const match = findRowByKey(snapshot, "id", id);
+
+  if (!match) {
+    return null;
+  }
+
+  const current = rowToAccountPayable(snapshot.headers, match.row);
+  const amount = "amount" in input ? numberValue(input.amount) : current.amount;
+  const paidAmount = "paidAmount" in input ? numberValue(input.paidAmount) : current.paidAmount;
+  const updated: AccountPayableRecord = {
+    ...current,
+    description: "description" in input ? stringValue(input.description) : current.description,
+    amount,
+    currency: "currency" in input ? normalizeCurrency(input.currency) : current.currency,
+    dueDate: "dueDate" in input ? stringValue(input.dueDate) : current.dueDate,
+    paidAmount,
+    status: "status" in input
+      ? normalizePayableStatus(input.status, paidAmount, amount)
+      : normalizePayableStatus(current.status, paidAmount, amount),
+    ownerType: "ownerType" in input ? parseOwnerType(input.ownerType) ?? current.ownerType : current.ownerType,
+    createdBy: "createdBy" in input ? stringValue(input.createdBy) : current.createdBy
+  };
+
+  await updateRow(env, ACCOUNTS_PAYABLE_SHEET_NAME, snapshot.headers, match.index, updated);
+  return updated;
+}
+
+export async function payAccountPayable(
+  env: Env,
+  input: { id: string; amount: number }
+): Promise<AccountPayableRecord | null> {
+  const snapshot = await readModuleSheet(env, ACCOUNTS_PAYABLE_SHEET_NAME, ACCOUNTS_PAYABLE_HEADERS);
+  const match = findRowByKey(snapshot, "id", input.id);
+
+  if (!match) {
+    return null;
+  }
+
+  const current = rowToAccountPayable(snapshot.headers, match.row);
+  const paidAmount = roundCurrency(current.paidAmount + Math.max(0, input.amount));
+  const updated: AccountPayableRecord = {
+    ...current,
+    paidAmount,
+    status: normalizePayableStatus(undefined, paidAmount, current.amount)
+  };
+
+  await updateRow(env, ACCOUNTS_PAYABLE_SHEET_NAME, snapshot.headers, match.index, updated);
+  return updated;
+}
+
+export async function summarizeBudgets(
+  env: Env,
+  transactions: TransactionRecord[],
+  monthYear: string
+): Promise<BudgetSummaryResponse> {
+  const snapshot = await readModuleSheet(env, BUDGET_SHEET_NAME, BUDGET_HEADERS);
+  const budgets = snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToBudget(snapshot.headers, row))
+    .filter((budget) => budget.monthYear === monthYear);
+
+  const items = budgets.map((budget) => {
+    const spent = roundCurrency(
+      transactions
+        .filter((transaction) =>
+          transaction.type === "expense" &&
+          transaction.date.slice(0, 7) === monthYear &&
+          normalizeForMatch(transaction.category) === normalizeForMatch(budget.category)
+        )
+        .reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0)
+    );
+    const available = roundCurrency(budget.monthlyLimit - spent);
+    const percentUsed = budget.monthlyLimit > 0 ? Math.round((spent / budget.monthlyLimit) * 10000) / 100 : 0;
+
+    return {
+      budget,
+      spent,
+      available,
+      percentUsed,
+      exceeded: spent > budget.monthlyLimit
+    };
+  });
+
+  return { monthYear, items };
 }
 
 export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthString()): Promise<CardsDashboardResponse> {
@@ -1716,6 +1857,7 @@ function buildInstallmentDetails(
     installmentNumber: item.installmentNumber,
     installmentTotal: item.installmentTotal,
     amount: item.amount,
+    currency: "ARS",
     dueMonth: summary.dueDate.slice(0, 7),
     dueDate: summary.dueDate,
     ownerType: "personal",
@@ -1839,6 +1981,7 @@ function buildInstallmentDetailRecordsFromPreview(
       installmentNumber: item.installmentNumber,
       installmentTotal: item.installmentTotal,
       amount: roundCurrency(item.amount),
+      currency: item.currency ?? "ARS",
       dueMonth,
       dueDate,
       ownerType: "Leandro" as const,
@@ -1915,6 +2058,14 @@ function normalizeInstallmentMerchantForMatch(value: string): string {
     .toUpperCase();
 }
 
+function normalizeForMatch(value: string): string {
+  return stringValue(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
 function rowToCard(headers: string[], row: string[]): CardRecord {
   const record = rowToObject(headers, row);
   return {
@@ -1934,6 +2085,10 @@ function rowToCard(headers: string[], row: string[]): CardRecord {
 
 function rowToCardSummary(headers: string[], row: string[]): CardSummaryRecord {
   const record = rowToObject(headers, row);
+  const totalAmount = numberValue(record.totalAmount);
+  const minimumPayment = numberValue(record.minimumPayment);
+  const totalAmountARS = numberValue(record.totalAmountARS) || totalAmount;
+  const minimumPaymentARS = numberValue(record.minimumPaymentARS) || minimumPayment;
   return {
     ...record,
     summaryId: stringValue(record.summaryId),
@@ -1948,8 +2103,12 @@ function rowToCardSummary(headers: string[], row: string[]): CardSummaryRecord {
     closingDate: stringValue(record.closingDate),
     dueDate: stringValue(record.dueDate),
     nextDueDate: stringValue(record.nextDueDate),
-    totalAmount: numberValue(record.totalAmount),
-    minimumPayment: numberValue(record.minimumPayment),
+    totalAmountARS,
+    totalAmountUSD: numberValue(record.totalAmountUSD),
+    minimumPaymentARS,
+    minimumPaymentUSD: numberValue(record.minimumPaymentUSD),
+    totalAmount: totalAmount || totalAmountARS,
+    minimumPayment: minimumPayment || minimumPaymentARS,
     currency: stringValue(record.currency),
     rawText: stringValue(record.rawText),
     rawDetectedData: stringValue(record.rawDetectedData),
@@ -2026,6 +2185,7 @@ function rowToInstallmentDetail(headers: string[], row: string[]): InstallmentDe
     installmentNumber: numberValue(record.installmentNumber),
     installmentTotal: numberValue(record.installmentTotal),
     amount: numberValue(record.amount),
+    currency: normalizeCurrency(record.currency),
     dueMonth: stringValue(record.dueMonth),
     dueDate: stringValue(record.dueDate),
     ownerType: parseOwnerType(record.ownerType) ?? "personal",
@@ -2055,6 +2215,38 @@ function rowToBusinessReimbursement(headers: string[], row: string[]): BusinessR
     reimbursedAmount: numberValue(record.reimbursedAmount),
     reimbursedDate: stringValue(record.reimbursedDate),
     notes: stringValue(record.notes),
+    createdAt: stringValue(record.createdAt)
+  };
+}
+
+function rowToAccountPayable(headers: string[], row: string[]): AccountPayableRecord {
+  const record = rowToObject(headers, row);
+  const amount = numberValue(record.amount);
+  const paidAmount = numberValue(record.paidAmount);
+  return {
+    ...record,
+    id: stringValue(record.id),
+    description: stringValue(record.description),
+    amount,
+    currency: normalizeCurrency(record.currency),
+    dueDate: stringValue(record.dueDate),
+    paidAmount,
+    status: normalizePayableStatus(record.status, paidAmount, amount),
+    ownerType: parseOwnerType(record.ownerType) ?? "Hogar",
+    createdBy: stringValue(record.createdBy),
+    createdAt: stringValue(record.createdAt)
+  };
+}
+
+function rowToBudget(headers: string[], row: string[]): BudgetRecord {
+  const record = rowToObject(headers, row);
+  return {
+    ...record,
+    id: stringValue(record.id),
+    category: stringValue(record.category),
+    monthlyLimit: numberValue(record.monthlyLimit),
+    monthYear: stringValue(record.monthYear),
+    ownerType: parseOwnerType(record.ownerType) ?? "Hogar",
     createdAt: stringValue(record.createdAt)
   };
 }
@@ -2512,6 +2704,27 @@ function normalizeStatementPaymentStatus(
   }
 
   return "PENDING";
+}
+
+function normalizePayableStatus(value: unknown, paidAmount: number, totalAmount: number): PayableStatus {
+  const explicit = stringValue(value).toUpperCase();
+  if (explicit === "PENDING" || explicit === "PARTIAL" || explicit === "PAID") {
+    return explicit;
+  }
+
+  if (totalAmount > 0 && paidAmount >= totalAmount) {
+    return "PAID";
+  }
+
+  if (paidAmount > 0) {
+    return "PARTIAL";
+  }
+
+  return "PENDING";
+}
+
+function normalizeCurrency(value: unknown): "ARS" | "USD" {
+  return stringValue(value).toUpperCase() === "USD" ? "USD" : "ARS";
 }
 
 function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {

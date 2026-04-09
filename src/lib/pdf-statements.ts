@@ -1255,7 +1255,7 @@ function cleanMastercardInstallmentMerchant(value: string): string {
 
 function parseVisaOnePaymentLine(line: string): ParsedCardStatementPreview["installmentsDetail"][number] | null {
   const match = line.match(
-    /^\d{1,2}(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+\.?\s+\d{2,4})?\s+(?:\d{3,}\s+)?(?:[A-Z]\s+|\*\s+)?(.+?)\s+(?:USD\s+)?([\d\.\,]+)(?:\s+([\d\.\,]+))?\s*$/i
+    /^\d{1,2}(?:\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+\.?\s+\d{2,4})?\s+(?:\d{3,}\s+)?(?:[A-Z]\s+|\*\s+)?(.+?)\s+(USD\s+)?([\d\.\,]+)(?:\s+([\d\.\,]+))?\s*$/i
   );
 
   if (!match) {
@@ -1263,7 +1263,8 @@ function parseVisaOnePaymentLine(line: string): ParsedCardStatementPreview["inst
   }
 
   const merchant = cleanOnePaymentMerchant(match[1] ?? "");
-  const amount = parseAmount(match[3] ?? match[2] ?? "");
+  const currency = match[2] ? "USD" : "ARS";
+  const amount = parseAmount(match[4] ?? match[3] ?? "");
 
   if (!merchant || amount <= 0 || shouldIgnoreCardConsumption(merchant)) {
     return null;
@@ -1275,6 +1276,7 @@ function parseVisaOnePaymentLine(line: string): ParsedCardStatementPreview["inst
     installmentNumber: 1,
     installmentTotal: 1,
     amount,
+    currency,
     remainingInstallments: 0
   };
 }

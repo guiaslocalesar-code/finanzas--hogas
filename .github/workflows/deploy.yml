@@ -36,8 +36,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: |
-            GEMINI_API_KEY
           command: deploy
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

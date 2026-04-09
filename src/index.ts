@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { runParserSmokeTests } from "./lib/pdf-statements";
 import {
+  createAccountPayable,
   createBusinessReimbursement,
   createCard,
   createCardSummary,
@@ -13,14 +14,18 @@ import {
   getCardStatementDetail,
   getInstallmentForecast,
   initializeFinanceModuleSheets,
+  listAccountsPayable,
   listBusinessReimbursements,
   listCardSummaries,
   listCards,
   listInstallmentProjections,
   listInstallments,
+  payAccountPayable,
   registerCardStatementPayment,
   registerReimbursementPayment,
+  summarizeBudgets,
   uploadCardStatementPdf,
+  updateAccountPayable,
   updateBusinessReimbursement,
   updateCard,
   updateCardStatement,
@@ -598,6 +603,80 @@ app.post("/api/reimbursements/register-payment", async (c) => {
 app.get("/api/cards/dashboard", async (c) => {
   const dashboard = await getCardsDashboard(c.env, normalizeYearMonthQuery(c.req.query("yearMonth")));
   return c.json(dashboard);
+});
+
+app.get("/api/accounts-payable", async (c) => {
+  const items = await listAccountsPayable(c.env);
+  return c.json(items);
+});
+
+app.post("/api/accounts-payable", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  if (!stringField(payload.description) || !dateField(payload.dueDate)) {
+    return c.json({ error: 'Fields "description" and "dueDate" are required.' }, 400);
+  }
+
+  const amount = parseAmount(payload.amount);
+  if (amount === null || amount <= 0) {
+    return c.json({ error: 'Field "amount" must be a valid number greater than zero.' }, 400);
+  }
+
+  const item = await createAccountPayable(c.env, { ...payload, amount });
+  return c.json(item, 201);
+});
+
+app.patch("/api/accounts-payable/:id", async (c) => {
+  const payload = await safeJson(c);
+  const id = c.req.param("id").trim();
+
+  if (!payload || !id) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const item = await updateAccountPayable(c.env, id, payload);
+
+  if (!item) {
+    return c.json({ error: "Account payable not found." }, 404);
+  }
+
+  return c.json(item);
+});
+
+app.post("/api/accounts-payable/pay", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const id = stringField(payload.id);
+  const amount = parseAmount(payload.amount);
+
+  if (!id || amount === null || amount <= 0) {
+    return c.json({ error: 'Fields "id" and positive "amount" are required.' }, 400);
+  }
+
+  const item = await payAccountPayable(c.env, { id, amount });
+
+  if (!item) {
+    return c.json({ error: "Account payable not found." }, 404);
+  }
+
+  return c.json({ ok: true, item });
+});
+
+app.get("/api/budgets/summary", async (c) => {
+  const monthYear =
+    normalizeYearMonthQuery(c.req.query("monthYear") ?? c.req.query("yearMonth")) ??
+    new Date().toISOString().slice(0, 7);
+  const transactions = await listTransactions(c.env);
+  const summary = await summarizeBudgets(c.env, transactions, monthYear);
+  return c.json(summary);
 });
 
 app.notFound(async (c) => {
