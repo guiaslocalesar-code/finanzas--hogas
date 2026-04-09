@@ -1,7 +1,7 @@
 import { AppError, type Env, type ParsedCardStatementPreview } from "./types";
 
 const GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-2.5-flash"] as const;
+const GEMINI_MODEL_CANDIDATES = ["gemini-2.5-flash"] as const;
 
 const NARANJA_PROMPT = `Sos un analista financiero experto en extraer datos de resúmenes de tarjetas de crédito argentinas, específicamente de Tarjeta Naranja.
 Analizá el documento y devolvé ÚNICAMENTE un JSON válido que coincida exactamente con la estructura requerida. No uses markdown.
@@ -164,48 +164,8 @@ async function requestGeminiJson(
       ],
       generationConfig: {
         responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            summary: {
-              type: "OBJECT",
-              properties: {
-                issuer: { type: "STRING", nullable: true },
-                holder: { type: "STRING", nullable: true },
-                closingDate: { type: "STRING", nullable: true },
-                dueDate: { type: "STRING", nullable: true },
-                nextDueDate: { type: "STRING", nullable: true },
-                totalAmount: { type: "NUMBER", nullable: true },
-                minimumPayment: { type: "NUMBER", nullable: true }
-              }
-            },
-            projections: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  monthLabel: { type: "STRING", nullable: true },
-                  yearMonth: { type: "STRING", nullable: true },
-                  amount: { type: "NUMBER", nullable: true }
-                }
-              }
-            },
-            installmentsDetail: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  merchant: { type: "STRING", nullable: true },
-                  purchaseDate: { type: "STRING", nullable: true },
-                  installmentNumber: { type: "NUMBER", nullable: true },
-                  installmentTotal: { type: "NUMBER", nullable: true },
-                  amount: { type: "NUMBER", nullable: true },
-                  remainingInstallments: { type: "NUMBER", nullable: true }
-                }
-              }
-            }
-          }
-        }
+        temperature: 0,
+        maxOutputTokens: 8192
       }
     })
   });
