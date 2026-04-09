@@ -1291,7 +1291,7 @@ function cleanOnePaymentMerchant(value: string): string {
 }
 
 function shouldIgnoreCardConsumption(value: string): boolean {
-  return /SU PAGO|PAGO EN|PAGO MINIMO|TRANSFERENCIA|DEUDA|SALDO|IMPUESTO|SELLOS?|DB IVA|IVA\b|IIBB|PERCEP|INTER[EÉ]S|COMISI[OÓ]N|MANTENIMIENTO|CARGO POR|AJUSTE/i.test(
+  return /SU PAGO|PAGO EN|PAGO MINIMO|TRANSFERENCIA|DEUDA|SALDO|IMPUESTO|SELLOS?|DB IVA|DB\.?\s*RG|IVA\b|IIBB|PERCEP|INTER[EÉ]S|COMISI[OÓ]N|MANTENIMIENTO|CARGO POR|AJUSTE/i.test(
     value
   );
 }
@@ -1663,6 +1663,11 @@ function normalizeIsoDate(value: string): string {
 }
 
 function formatSpanishMonthDate(dayToken: string, monthToken: string, yearToken: string): string {
+  const normalizedYear = Number(normalizeYearToken(yearToken));
+  if (!Number.isFinite(normalizedYear) || normalizedYear < 2020) {
+    return "";
+  }
+
   return parseLooseDate(`${dayToken} ${monthToken} ${yearToken}`);
 }
 
