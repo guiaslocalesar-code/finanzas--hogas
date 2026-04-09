@@ -329,6 +329,14 @@ export interface CardStatementProjectionPreview {
   amount: number;
 }
 
+export interface CardStatementInstallmentPreview {
+  merchant: string;
+  installmentNumber: number;
+  installmentTotal: number;
+  amount: number;
+  remainingInstallments: number;
+}
+
 export interface ParsedCardStatementPreview {
   issuer: string;
   brand: string;
@@ -340,6 +348,7 @@ export interface ParsedCardStatementPreview {
   totalAmount: number;
   minimumPayment: number;
   projections: CardStatementProjectionPreview[];
+  installmentsDetail: CardStatementInstallmentPreview[];
   rawDetectedData: Record<string, unknown>;
   warnings: string[];
 }
@@ -350,6 +359,7 @@ export interface UploadedCardStatementResult {
   preview: ParsedCardStatementPreview;
   summary: CardSummaryRecord | null;
   projections: InstallmentProjectionRecord[];
+  installmentsDetail: InstallmentDetailRecord[];
 }
 
 export interface CardStatementUploadDebugResult {

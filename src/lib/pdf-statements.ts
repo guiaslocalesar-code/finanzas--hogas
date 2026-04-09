@@ -111,6 +111,7 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
   const minimumPayment = amountAnalysis.minimumPayment.value;
   const projectionAnalysis = parseBnaStyleProjections(text);
   const projections = projectionAnalysis.projections;
+  const installmentAnalysis = parseVisaInstallmentDetail(text);
 
   if (totalAmount <= 0) {
     warnings.push('Field "totalAmount" could not be detected.');
@@ -135,6 +136,7 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
     totalAmount,
     minimumPayment,
     projections,
+    installmentsDetail: installmentAnalysis.installments,
     rawDetectedData: buildParserDebug(
       "parseVisaSantanderStatement",
       text,
@@ -146,7 +148,9 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
         amountDetection: {
           totalAmount: amountAnalysis.totalAmount,
           minimumPayment: amountAnalysis.minimumPayment
-        }
+        },
+        installmentsDetailFound: installmentAnalysis.installments.length,
+        installmentCandidateLines: installmentAnalysis.candidateLines
       }
     ),
     warnings
@@ -183,6 +187,7 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
     totalAmount,
     minimumPayment,
     projections,
+    installmentsDetail: [],
     rawDetectedData: buildParserDebug(
       "parseVisaBnaStatement",
       text,
@@ -216,6 +221,7 @@ export function parseMastercardBnaStatement(text: string): ParsedCardStatementPr
   const minimumPayment = detectAmount(text, [/Pago[\s\S]{0,16}?nimo:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
   const projectionAnalysis = parseMastercardBnaProjections(text, dueDate);
   const projections = projectionAnalysis.projections;
+  const installmentAnalysis = parseMastercardInstallmentDetail(text);
 
   if (projections.length === 0) {
     warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Mastercard BNA.");
@@ -232,7 +238,19 @@ export function parseMastercardBnaStatement(text: string): ParsedCardStatementPr
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: buildParserDebug("parseMastercardBnaStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
+    installmentsDetail: installmentAnalysis.installments,
+    rawDetectedData: buildParserDebug(
+      "parseMastercardBnaStatement",
+      text,
+      warnings,
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      projections,
+      projectionAnalysis.candidateBlocks,
+      {
+        installmentsDetailFound: installmentAnalysis.installments.length,
+        installmentCandidateLines: installmentAnalysis.candidateLines
+      }
+    ),
     warnings
   };
 }
@@ -273,6 +291,7 @@ export function parseNaranjaXStatement(text: string): ParsedCardStatementPreview
     totalAmount,
     minimumPayment,
     projections,
+    installmentsDetail: [],
     rawDetectedData: buildParserDebug("parseNaranjaXStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
     warnings
   };
@@ -336,6 +355,7 @@ function parseNaranjaXStatementV2(text: string): ParsedCardStatementPreview {
     totalAmount,
     minimumPayment,
     projections,
+    installmentsDetail: [],
     rawDetectedData: buildParserDebug("parseNaranjaXStatementV2", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
     warnings
   };
@@ -366,6 +386,7 @@ export function parseDetectedStatement(text: string, fileName = ""): ParsedCardS
       totalAmount: 0,
       minimumPayment: 0,
       projections: [],
+      installmentsDetail: [],
       rawDetectedData: {
         parser: "fallback",
         fileName,
@@ -993,6 +1014,118 @@ function parseBnaStyleProjections(text: string): {
   return parseProjectionBlocks(text, [/CUOTAS?\s+A\s+VENCER/i], [/RESUMEN CONSOLIDADO/i, /DETALLE DEL/i, /COMPRAS DEL MES/i]);
 }
 
+type InstallmentDetailAnalysis = {
+  installments: ParsedCardStatementPreview["installmentsDetail"];
+  candidateLines: string[];
+};
+
+function parseVisaInstallmentDetail(text: string): InstallmentDetailAnalysis {
+  const installments: ParsedCardStatementPreview["installmentsDetail"] = [];
+  const candidateLines: string[] = [];
+
+  for (const rawLine of text.split("\n")) {
+    const line = collapseSpaces(rawLine);
+    const match = line.match(/^(.*?)\bC\.(\d{1,2})\/(\d{1,2})\b\s+([\d\.\,]+)\s*$/i);
+    if (!match) {
+      continue;
+    }
+
+    const installmentNumber = Number(match[2]);
+    const installmentTotal = Number(match[3]);
+    const amount = parseAmount(match[4] ?? "");
+    const merchant = cleanVisaInstallmentMerchant(match[1] ?? "");
+
+    if (!merchant || !isValidInstallment(installmentNumber, installmentTotal, amount)) {
+      continue;
+    }
+
+    candidateLines.push(line);
+    installments.push({
+      merchant,
+      installmentNumber,
+      installmentTotal,
+      amount,
+      remainingInstallments: Math.max(installmentTotal - installmentNumber, 0)
+    });
+  }
+
+  return {
+    installments,
+    candidateLines: candidateLines.slice(0, 20)
+  };
+}
+
+function parseMastercardInstallmentDetail(text: string): InstallmentDetailAnalysis {
+  const installments: ParsedCardStatementPreview["installmentsDetail"] = [];
+  const candidateLines: string[] = [];
+
+  for (const rawLine of text.split("\n")) {
+    const line = collapseSpaces(rawLine);
+    if (/\bC\.\d{1,2}\/\d{1,2}\b/i.test(line)) {
+      continue;
+    }
+
+    const match = line.match(/^(.*?)\s+(\d{1,2})\/(\d{1,2})\s+([\d\.\,]+)\s*$/);
+    if (!match) {
+      continue;
+    }
+
+    const installmentNumber = Number(match[2]);
+    const installmentTotal = Number(match[3]);
+    const amount = parseAmount(match[4] ?? "");
+    const merchant = cleanMastercardInstallmentMerchant(match[1] ?? "");
+
+    if (!merchant || !isValidInstallment(installmentNumber, installmentTotal, amount)) {
+      continue;
+    }
+
+    candidateLines.push(line);
+    installments.push({
+      merchant,
+      installmentNumber,
+      installmentTotal,
+      amount,
+      remainingInstallments: Math.max(installmentTotal - installmentNumber, 0)
+    });
+  }
+
+  return {
+    installments,
+    candidateLines: candidateLines.slice(0, 20)
+  };
+}
+
+function cleanVisaInstallmentMerchant(value: string): string {
+  return collapseSpaces(
+    value
+      .replace(/^\d{1,2}\s+/, "")
+      .replace(/^\d{3,}\s+/, "")
+      .replace(/^\*\s*/, "")
+      .replace(/\s+\*+\s*/g, " ")
+      .replace(/\b\d{3,}\b/g, "")
+  );
+}
+
+function cleanMastercardInstallmentMerchant(value: string): string {
+  return collapseSpaces(
+    value
+      .replace(/^\d{1,2}[-\/][A-Za-z]{3}[-\/]\d{2,4}\s+/, "")
+      .replace(/^\*\s*/, "")
+      .replace(/\s+\*+\s*/g, " ")
+  );
+}
+
+function isValidInstallment(installmentNumber: number, installmentTotal: number, amount: number): boolean {
+  return (
+    Number.isInteger(installmentNumber) &&
+    Number.isInteger(installmentTotal) &&
+    installmentNumber >= 1 &&
+    installmentTotal >= installmentNumber &&
+    installmentTotal > 1 &&
+    amount > 0
+  );
+}
+
 function parseMastercardBnaProjections(
   text: string,
   dueDate: string
@@ -1269,6 +1402,15 @@ function normalizeParsedPreview(parsed: ParsedCardStatementPreview): ParsedCardS
       }))
       .filter((item) => isYearMonth(item.yearMonth))
   );
+  const installmentsDetail = (parsed.installmentsDetail ?? [])
+    .map((item) => ({
+      merchant: collapseSpaces(item.merchant),
+      installmentNumber: Math.max(0, Math.trunc(item.installmentNumber)),
+      installmentTotal: Math.max(0, Math.trunc(item.installmentTotal)),
+      amount: Math.max(0, roundCurrency(item.amount)),
+      remainingInstallments: Math.max(0, Math.trunc(item.remainingInstallments))
+    }))
+    .filter((item) => item.merchant && isValidInstallment(item.installmentNumber, item.installmentTotal, item.amount));
 
   return {
     ...parsed,
@@ -1278,6 +1420,7 @@ function normalizeParsedPreview(parsed: ParsedCardStatementPreview): ParsedCardS
     totalAmount: Math.max(0, roundCurrency(parsed.totalAmount)),
     minimumPayment: Math.max(0, roundCurrency(parsed.minimumPayment)),
     projections,
+    installmentsDetail,
     warnings: Array.from(new Set(parsed.warnings.map((warning) => collapseSpaces(warning)).filter(Boolean)))
   };
 }

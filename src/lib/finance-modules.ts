@@ -303,7 +303,8 @@ export async function uploadCardStatementPdf(
       fileName,
       preview: analysis.preview,
       summary: null,
-      projections: []
+      projections: [],
+      installmentsDetail: []
     };
   }
 
@@ -346,6 +347,7 @@ export async function uploadCardStatementPdf(
     INSTALLMENT_PROJECTION_SHEET_NAME,
     INSTALLMENT_PROJECTION_HEADERS
   );
+  const installmentSheet = await readModuleSheet(env, INSTALLMENT_DETAIL_SHEET_NAME, INSTALLMENT_DETAIL_HEADERS);
 
   const summary = await appendCardSummaryFromUpload(env, summarySheet.headers, {
     cardId,
@@ -358,6 +360,13 @@ export async function uploadCardStatementPdf(
   });
 
   const projections = buildProjectionRecordsFromPreview(summary, analysis.preview);
+  const historicalInstallments = installmentSheet.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToInstallmentDetail(installmentSheet.headers, row));
+  const installmentsDetail = inheritInstallmentClassifications(
+    buildInstallmentDetailRecordsFromPreview(summary, analysis.preview),
+    historicalInstallments
+  );
 
   if (projections.length > 0) {
     logUploadStage("save-projections-start", {
@@ -367,10 +376,20 @@ export async function uploadCardStatementPdf(
     await appendRows(env, INSTALLMENT_PROJECTION_SHEET_NAME, projectionSheet.headers, projections);
   }
 
+  if (installmentsDetail.length > 0) {
+    logUploadStage("save-installments-detail-start", {
+      summaryId: summary.summaryId,
+      count: installmentsDetail.length
+    });
+    await appendRows(env, INSTALLMENT_DETAIL_SHEET_NAME, installmentSheet.headers, installmentsDetail);
+    await Promise.all(installmentsDetail.map((installment) => syncInstallmentReimbursement(env, installment)));
+  }
+
   logUploadStage("save-complete", {
     fileName,
     summaryId: summary.summaryId,
-    projections: projections.length
+    projections: projections.length,
+    installmentsDetail: installmentsDetail.length
   });
 
   return {
@@ -378,7 +397,8 @@ export async function uploadCardStatementPdf(
     fileName,
     preview: analysis.preview,
     summary,
-    projections
+    projections,
+    installmentsDetail
   };
 }
 
@@ -459,6 +479,12 @@ export async function getCardStatementDetail(
           amount: item.amount
         }))
       : reparsed?.projections ?? [];
+  const installmentsDetail =
+    installments.length > 0
+      ? installments
+      : reparsed
+        ? buildInstallmentDetailRecordsFromPreview(summary, reparsed)
+        : [];
   const parsed: ParsedCardStatementPreview = {
     issuer: reparsed?.issuer || summary.issuer,
     brand: reparsed?.brand || summary.brand,
@@ -470,6 +496,7 @@ export async function getCardStatementDetail(
     totalAmount: summary.totalAmount > 0 ? summary.totalAmount : reparsed?.totalAmount ?? 0,
     minimumPayment: summary.minimumPayment > 0 ? summary.minimumPayment : reparsed?.minimumPayment ?? 0,
     projections: parsedProjections,
+    installmentsDetail: reparsed?.installmentsDetail ?? [],
     rawDetectedData: parserDebug,
     warnings: parsedWarnings
   };
@@ -480,7 +507,7 @@ export async function getCardStatementDetail(
       stage: "detail-built",
       summaryId: summary.summaryId,
       projections: projections.length,
-      installmentsDetail: installments.length,
+      installmentsDetail: installmentsDetail.length,
       reparsedFromRawText: Boolean(reparsed),
       warnings: parsedWarnings.length
     })
@@ -490,7 +517,7 @@ export async function getCardStatementDetail(
     ok: true,
     summary,
     projections,
-    installmentsDetail: installments,
+    installmentsDetail,
     warnings: parsedWarnings,
     parseSource: reparsed ? "rawText-reparsed" : summary.parseStatus || "stored-summary",
     confidenceScore:
@@ -648,6 +675,7 @@ function buildPdfFallbackPreview(fileName: string, message: string, detectedIssu
     totalAmount: 0,
     minimumPayment: 0,
     projections: [],
+    installmentsDetail: [],
     rawDetectedData: {
       parser: "fallback",
       fileName,
@@ -1604,6 +1632,101 @@ function buildProjectionRecordsFromPreview(
   }
 
   return [];
+}
+
+function buildInstallmentDetailRecordsFromPreview(
+  summary: CardSummaryRecord,
+  preview: ParsedCardStatementPreview
+): InstallmentDetailRecord[] {
+  const createdAt = new Date().toISOString();
+  const dueDate = summary.dueDate || preview.dueDate;
+  const dueMonth = dueDate ? dueDate.slice(0, 7) : "";
+
+  return preview.installmentsDetail
+    .filter((item) => item.merchant && item.amount > 0 && item.installmentTotal > 1)
+    .map((item) => ({
+      installmentId: generateId("installment"),
+      summaryId: summary.summaryId,
+      cardId: summary.cardId,
+      purchaseDate: "",
+      merchant: item.merchant,
+      installmentNumber: item.installmentNumber,
+      installmentTotal: item.installmentTotal,
+      amount: roundCurrency(item.amount),
+      dueMonth,
+      dueDate,
+      ownerType: "personal" as const,
+      businessPercent: 0,
+      businessAmount: 0,
+      personalAmount: roundCurrency(item.amount),
+      reimbursementStatus: "pending" as const,
+      notes: `Cuota ${item.installmentNumber}/${item.installmentTotal}. Restantes: ${item.remainingInstallments}`,
+      createdAt
+    }));
+}
+
+function inheritInstallmentClassifications(
+  newInstallments: InstallmentDetailRecord[],
+  historicalInstallments: InstallmentDetailRecord[]
+): InstallmentDetailRecord[] {
+  return newInstallments.map((installment) => {
+    const previous = findPreviousInstallmentMatch(installment, historicalInstallments);
+
+    if (!previous) {
+      return installment;
+    }
+
+    return {
+      ...installment,
+      ownerType: previous.ownerType,
+      businessPercent: previous.businessPercent,
+      businessAmount: previous.businessAmount,
+      personalAmount: previous.personalAmount,
+      reimbursementStatus: previous.reimbursementStatus === "paid" ? "pending" : previous.reimbursementStatus,
+      notes: previous.notes
+    };
+  });
+}
+
+export function findPreviousInstallmentMatch(
+  newInstallment: InstallmentDetailRecord,
+  historicalInstallments: InstallmentDetailRecord[]
+): InstallmentDetailRecord | null {
+  const normalizedMerchant = normalizeInstallmentMerchantForMatch(newInstallment.merchant);
+
+  if (!normalizedMerchant || newInstallment.amount <= 0 || newInstallment.installmentTotal <= 1) {
+    return null;
+  }
+
+  return historicalInstallments
+    .filter((candidate) => {
+      const candidateMerchant = normalizeInstallmentMerchantForMatch(candidate.merchant);
+      const merchantMatches =
+        candidateMerchant === normalizedMerchant ||
+        (candidateMerchant.length >= 5 &&
+          normalizedMerchant.length >= 5 &&
+          (candidateMerchant.includes(normalizedMerchant) || normalizedMerchant.includes(candidateMerchant)));
+
+      return (
+        candidate.installmentId !== newInstallment.installmentId &&
+        candidate.installmentTotal === newInstallment.installmentTotal &&
+        candidate.installmentNumber < newInstallment.installmentNumber &&
+        roundCurrency(candidate.amount) === roundCurrency(newInstallment.amount) &&
+        merchantMatches
+      );
+    })
+    .sort(
+      (left, right) =>
+        right.installmentNumber - left.installmentNumber || right.createdAt.localeCompare(left.createdAt)
+    )[0] ?? null;
+}
+
+function normalizeInstallmentMerchantForMatch(value: string): string {
+  return stringValue(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^A-Za-z0-9]/g, "")
+    .toUpperCase();
 }
 
 function rowToCard(headers: string[], row: string[]): CardRecord {
