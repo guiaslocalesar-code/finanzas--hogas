@@ -373,12 +373,6 @@ export async function uploadCardStatementPdf(
   });
 
   const summarySheet = await readModuleSheet(env, CARD_SUMMARY_SHEET_NAME, CARD_SUMMARY_HEADERS);
-  const projectionSheet = await readModuleSheet(
-    env,
-    INSTALLMENT_PROJECTION_SHEET_NAME,
-    INSTALLMENT_PROJECTION_HEADERS
-  );
-  const installmentSheet = await readModuleSheet(env, INSTALLMENT_DETAIL_SHEET_NAME, INSTALLMENT_DETAIL_HEADERS);
 
   const summary = await appendCardSummaryFromUpload(env, summarySheet.headers, {
     cardId,
@@ -390,30 +384,50 @@ export async function uploadCardStatementPdf(
     nextDueDate
   });
 
-  const projections = buildProjectionRecordsFromPreview(summary, analysis.preview);
-  const historicalInstallments = installmentSheet.rows
-    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
-    .map((row) => rowToInstallmentDetail(installmentSheet.headers, row));
-  const installmentsDetail = inheritInstallmentClassifications(
-    buildInstallmentDetailRecordsFromPreview(summary, analysis.preview),
-    historicalInstallments
-  );
+  let projections: InstallmentProjectionRecord[] = [];
+  let installmentsDetail: InstallmentDetailRecord[] = [];
 
-  if (projections.length > 0) {
-    logUploadStage("save-projections-start", {
-      summaryId: summary.summaryId,
-      count: projections.length
-    });
-    await appendRows(env, INSTALLMENT_PROJECTION_SHEET_NAME, projectionSheet.headers, projections);
-  }
+  try {
+    const projectionSheet = await readModuleSheet(
+      env,
+      INSTALLMENT_PROJECTION_SHEET_NAME,
+      INSTALLMENT_PROJECTION_HEADERS
+    );
+    const installmentSheet = await readModuleSheet(env, INSTALLMENT_DETAIL_SHEET_NAME, INSTALLMENT_DETAIL_HEADERS);
 
-  if (installmentsDetail.length > 0) {
-    logUploadStage("save-installments-detail-start", {
+    projections = buildProjectionRecordsFromPreview(summary, analysis.preview);
+    const historicalInstallments = installmentSheet.rows
+      .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+      .map((row) => rowToInstallmentDetail(installmentSheet.headers, row));
+    installmentsDetail = inheritInstallmentClassifications(
+      buildInstallmentDetailRecordsFromPreview(summary, analysis.preview),
+      historicalInstallments
+    );
+
+    if (projections.length > 0) {
+      logUploadStage("save-projections-start", {
+        summaryId: summary.summaryId,
+        count: projections.length
+      });
+      await appendRows(env, INSTALLMENT_PROJECTION_SHEET_NAME, projectionSheet.headers, projections);
+    }
+
+    if (installmentsDetail.length > 0) {
+      logUploadStage("save-installments-detail-start", {
+        summaryId: summary.summaryId,
+        count: installmentsDetail.length
+      });
+      await appendRows(env, INSTALLMENT_DETAIL_SHEET_NAME, installmentSheet.headers, installmentsDetail);
+      await Promise.all(installmentsDetail.map((installment) => syncInstallmentReimbursement(env, installment)));
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const warning = "El resumen se guardó, pero falló el guardado de cuotas/proyecciones.";
+    analysis.preview.warnings.push(`${warning} ${message}`);
+    logUploadStage("save-related-data-failed", {
       summaryId: summary.summaryId,
-      count: installmentsDetail.length
+      error: message
     });
-    await appendRows(env, INSTALLMENT_DETAIL_SHEET_NAME, installmentSheet.headers, installmentsDetail);
-    await Promise.all(installmentsDetail.map((installment) => syncInstallmentReimbursement(env, installment)));
   }
 
   logUploadStage("save-complete", {
