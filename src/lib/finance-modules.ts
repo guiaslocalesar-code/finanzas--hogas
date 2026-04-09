@@ -416,12 +416,24 @@ export async function getCardStatementDetail(
   env: Env,
   summaryId: string
 ): Promise<CardStatementDetailResult | null> {
-  const summary = await getCardStatement(env, summaryId);
+  const normalizedSummaryId = summaryId.trim();
+  const snapshot = await readModuleSheet(env, CARD_SUMMARY_SHEET_NAME, CARD_SUMMARY_HEADERS);
+  const match = findRowByKey(snapshot, "summaryId", normalizedSummaryId);
+  console.log(
+    "[card-statements/detail]",
+    JSON.stringify({
+      stage: "lookup-summary",
+      summaryId: normalizedSummaryId,
+      found: Boolean(match),
+      rowIndex: match ? match.index + 2 : null
+    })
+  );
 
-  if (!summary) {
+  if (!match) {
     return null;
   }
 
+  const summary = rowToCardSummary(snapshot.headers, match.row);
   const projections = (await listInstallmentProjections(env)).filter((item) => item.summaryId === summary.summaryId);
   const installments = (await listInstallments(env)).filter((item) => item.summaryId === summary.summaryId);
   const storedParserDebug = parseStoredRecord(summary.rawDetectedData);
@@ -462,17 +474,41 @@ export async function getCardStatementDetail(
     warnings: parsedWarnings
   };
 
+  console.log(
+    "[card-statements/detail]",
+    JSON.stringify({
+      stage: "detail-built",
+      summaryId: summary.summaryId,
+      projections: projections.length,
+      installmentsDetail: installments.length,
+      reparsedFromRawText: Boolean(reparsed),
+      warnings: parsedWarnings.length
+    })
+  );
+
   return {
     ok: true,
     summary,
     projections,
-    installments,
+    installmentsDetail: installments,
+    warnings: parsedWarnings,
+    parseSource: reparsed ? "rawText-reparsed" : summary.parseStatus || "stored-summary",
+    confidenceScore:
+      reparsed
+        ? parsed.totalAmount > 0 || parsed.minimumPayment > 0 || parsed.projections.length > 0
+          ? 0.75
+          : 0.35
+        : summary.parseStatus === "parsed"
+          ? 0.9
+          : summary.parseStatus === "parsed-with-warnings"
+            ? 0.7
+            : null,
     parsed,
     parserDebug
   };
 }
 
-export async function debugCardStatement(env: Env, summaryId: string): Promise<DebugCardStatementResult | null> {
+export async function debugCardStatement(env: Env, summaryId: string): Promise<CardStatementDetailResult | null> {
   return getCardStatementDetail(env, summaryId);
 }
 
@@ -603,8 +639,8 @@ function buildPdfFallbackPreview(fileName: string, message: string, detectedIssu
           : "Desconocido";
   return {
     issuer: issuerLabel,
-    brand: "",
-    bank: "",
+    brand: detectedIssuer === "naranja-x" ? "Naranja X" : "",
+    bank: detectedIssuer === "naranja-x" ? "Naranja X" : "",
     holder: "",
     closingDate: "",
     dueDate: "",
@@ -616,12 +652,14 @@ function buildPdfFallbackPreview(fileName: string, message: string, detectedIssu
       parser: "fallback",
       fileName,
       failure: message,
-      detectedIssuer
+      detectedIssuer,
+      parseSource: "fallback-manual-required",
+      textState: detectedIssuer === "naranja-x" ? "not-legible-or-image-based" : "not-legible"
     },
     warnings: [
       "No se pudo parsear automáticamente este PDF.",
       detectedIssuer === "naranja-x"
-        ? "El PDF de Naranja X no expone texto seleccionable legible con el parser actual."
+        ? "El PDF de Naranja X requiere un fallback especial porque no expone texto legible con el extractor actual."
         : "No se detectó una tabla confiable de cuotas futuras.",
       message,
       "Podés continuar con la carga manual."

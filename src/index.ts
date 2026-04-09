@@ -10,6 +10,7 @@ import {
   deleteCard,
   getCardsDashboard,
   getCardStatement,
+  getCardStatementDetail,
   getInstallmentForecast,
   initializeFinanceModuleSheets,
   listBusinessReimbursements,
@@ -225,6 +226,37 @@ app.delete("/api/cards/:id", async (c) => {
 app.get("/api/card-statements", async (c) => {
   const summaries = await listCardSummaries(c.env);
   return c.json(summaries);
+});
+
+app.get("/api/card-statements/summary/:id", async (c) => {
+  const summaryId = c.req.param("id").trim();
+  console.log("[card-statements/summary]", JSON.stringify({ stage: "request", summaryId }));
+  const detail = await getCardStatementDetail(c.env, summaryId);
+
+  if (!detail) {
+    console.log("[card-statements/summary]", JSON.stringify({ stage: "not-found", summaryId }));
+    return c.json(
+      {
+        ok: false,
+        error: "STATEMENT_NOT_FOUND",
+        message: "No se encontró el detalle del resumen",
+        summaryId
+      },
+      404
+    );
+  }
+
+  console.log(
+    "[card-statements/summary]",
+    JSON.stringify({
+      stage: "response",
+      summaryId,
+      projections: detail.projections.length,
+      installmentsDetail: detail.installmentsDetail.length,
+      warnings: detail.warnings.length
+    })
+  );
+  return c.json(detail);
 });
 
 app.get("/api/card-statements/:id", async (c) => {

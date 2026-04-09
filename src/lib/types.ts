@@ -373,7 +373,17 @@ export interface DebugCardStatementResult {
   parserDebug: Record<string, unknown>;
 }
 
-export interface CardStatementDetailResult extends DebugCardStatementResult {}
+export interface CardStatementDetailResult {
+  ok: true;
+  summary: CardSummaryRecord;
+  projections: InstallmentProjectionRecord[];
+  installmentsDetail: InstallmentDetailRecord[];
+  warnings: string[];
+  parseSource: string | null;
+  confidenceScore: number | null;
+  parsed: ParsedCardStatementPreview;
+  parserDebug: Record<string, unknown>;
+}
 
 export interface GoogleTokenResponse {
   access_token: string;
