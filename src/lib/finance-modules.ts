@@ -15,6 +15,7 @@ import {
   type AppErrorStep,
   type BusinessReimbursementRecord,
   type CardStatementUploadDebugResult,
+  type CardStatementDetailResult,
   type CardsDashboardResponse,
   type CardRecord,
   type CardSummaryImportResult,
@@ -411,7 +412,10 @@ export async function debugUploadCardStatementPdf(
   };
 }
 
-export async function debugCardStatement(env: Env, summaryId: string): Promise<DebugCardStatementResult | null> {
+export async function getCardStatementDetail(
+  env: Env,
+  summaryId: string
+): Promise<CardStatementDetailResult | null> {
   const summary = await getCardStatement(env, summaryId);
 
   if (!summary) {
@@ -419,31 +423,57 @@ export async function debugCardStatement(env: Env, summaryId: string): Promise<D
   }
 
   const projections = (await listInstallmentProjections(env)).filter((item) => item.summaryId === summary.summaryId);
+  const installments = (await listInstallments(env)).filter((item) => item.summaryId === summary.summaryId);
+  const storedParserDebug = parseStoredRecord(summary.rawDetectedData);
+  const reparsed =
+    summary.rawText && (summary.totalAmount <= 0 || summary.minimumPayment <= 0 || !summary.nextDueDate || projections.length === 0)
+      ? parseDetectedStatement(summary.rawText, summary.fileName)
+      : null;
+  const parserDebug = reparsed
+    ? {
+        ...storedParserDebug,
+        reparsedFromRawText: true,
+        reparsedPreview: reparsed.rawDetectedData
+      }
+    : storedParserDebug;
+  const parsedWarnings = Array.from(
+    new Set([...parseStoredStringArray(summary.warnings), ...(reparsed?.warnings ?? [])].filter(Boolean))
+  );
+  const parsedProjections =
+    projections.length > 0
+      ? projections.map((item) => ({
+          monthLabel: item.monthLabel,
+          yearMonth: item.yearMonth,
+          amount: item.amount
+        }))
+      : reparsed?.projections ?? [];
   const parsed: ParsedCardStatementPreview = {
-    issuer: summary.issuer,
-    brand: summary.brand,
-    bank: summary.bank,
-    holder: summary.holder,
+    issuer: reparsed?.issuer || summary.issuer,
+    brand: reparsed?.brand || summary.brand,
+    bank: reparsed?.bank || summary.bank,
+    holder: reparsed?.holder || summary.holder,
     closingDate: summary.closingDate,
     dueDate: summary.dueDate,
-    nextDueDate: summary.nextDueDate,
-    totalAmount: summary.totalAmount,
-    minimumPayment: summary.minimumPayment,
-    projections: projections.map((item) => ({
-      monthLabel: item.monthLabel,
-      yearMonth: item.yearMonth,
-      amount: item.amount
-    })),
-    rawDetectedData: parseStoredRecord(summary.rawDetectedData),
-    warnings: parseStoredStringArray(summary.warnings)
+    nextDueDate: summary.nextDueDate || reparsed?.nextDueDate || "",
+    totalAmount: summary.totalAmount > 0 ? summary.totalAmount : reparsed?.totalAmount ?? 0,
+    minimumPayment: summary.minimumPayment > 0 ? summary.minimumPayment : reparsed?.minimumPayment ?? 0,
+    projections: parsedProjections,
+    rawDetectedData: parserDebug,
+    warnings: parsedWarnings
   };
 
   return {
     ok: true,
     summary,
     projections,
-    parsed
+    installments,
+    parsed,
+    parserDebug
   };
+}
+
+export async function debugCardStatement(env: Env, summaryId: string): Promise<DebugCardStatementResult | null> {
+  return getCardStatementDetail(env, summaryId);
 }
 
 async function analyzeUploadedCardStatement(
@@ -465,16 +495,18 @@ async function analyzeUploadedCardStatement(
     logUploadStage("extract-text-success", { fileName, chars: rawText.length });
   } catch (error) {
     const appError = error instanceof AppError ? error : new AppError("parse-pdf", "No se pudo extraer texto del PDF.", String(error), 400);
+    const fallbackIssuer = safeDetectIssuerFromUpload(fileName);
     logUploadStage("extract-text-failed", {
       fileName,
+      detectedIssuer: fallbackIssuer,
       error: appError.message,
       details: appError.details ?? ""
     });
     return {
       rawText: "",
-      detectedIssuer: "unknown",
+      detectedIssuer: fallbackIssuer,
       textExtractedLength: 0,
-      preview: buildPdfFallbackPreview(fileName, appError.message),
+      preview: buildPdfFallbackPreview(fileName, appError.message, fallbackIssuer),
       canSave: false
     };
   }
@@ -507,7 +539,7 @@ async function analyzeUploadedCardStatement(
       error: appError.message,
       details: appError.details ?? ""
     });
-    preview = buildPdfFallbackPreview(fileName, appError.message);
+    preview = buildPdfFallbackPreview(fileName, appError.message, detectedIssuer);
   }
 
   return {
@@ -559,9 +591,18 @@ async function appendCardSummaryFromUpload(
   return record;
 }
 
-function buildPdfFallbackPreview(fileName: string, message: string): ParsedCardStatementPreview {
+function buildPdfFallbackPreview(fileName: string, message: string, detectedIssuer = "unknown"): ParsedCardStatementPreview {
+  const issuerLabel = detectedIssuer === "naranja-x"
+    ? "Naranja X"
+    : detectedIssuer === "mastercard-bna"
+      ? "Mastercard BNA"
+      : detectedIssuer === "visa-bna"
+        ? "VISA BNA"
+        : detectedIssuer === "visa-santander"
+          ? "VISA Santander"
+          : "Desconocido";
   return {
-    issuer: "Desconocido",
+    issuer: issuerLabel,
     brand: "",
     bank: "",
     holder: "",
@@ -574,14 +615,26 @@ function buildPdfFallbackPreview(fileName: string, message: string): ParsedCardS
     rawDetectedData: {
       parser: "fallback",
       fileName,
-      failure: message
+      failure: message,
+      detectedIssuer
     },
     warnings: [
       "No se pudo parsear automáticamente este PDF.",
+      detectedIssuer === "naranja-x"
+        ? "El PDF de Naranja X no expone texto seleccionable legible con el parser actual."
+        : "No se detectó una tabla confiable de cuotas futuras.",
       message,
       "Podés continuar con la carga manual."
     ]
   };
+}
+
+function safeDetectIssuerFromUpload(fileName: string): string {
+  try {
+    return detectIssuerFromText("", fileName);
+  } catch {
+    return "unknown";
+  }
 }
 
 function logUploadStage(stage: string, payload: Record<string, unknown>): void {
@@ -1705,13 +1758,40 @@ function parseStoredStringArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value);
     if (Array.isArray(parsed)) {
-      return parsed.map((item) => String(item).trim()).filter(Boolean);
+      return parsed.map(stringifyUnknownArrayItem).filter(Boolean);
+    }
+    if (parsed && typeof parsed === "object") {
+      return Object.entries(parsed)
+        .map(([key, item]) => `${key}: ${stringifyUnknownArrayItem(item)}`.trim())
+        .filter(Boolean);
+    }
+    if (typeof parsed === "string") {
+      return [parsed.trim()].filter(Boolean);
     }
   } catch {
-    return [value];
+    return [value.trim()].filter(Boolean);
   }
 
   return [];
+}
+
+function stringifyUnknownArrayItem(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => `${key}: ${stringifyUnknownArrayItem(item)}`.trim())
+      .filter(Boolean)
+      .join(", ");
+  }
+
+  return "";
 }
 
 function normalizeIsoDateValue(value: string): string {

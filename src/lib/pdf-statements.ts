@@ -52,9 +52,10 @@ export async function extractPdfText(pdfBytes: ArrayBuffer): Promise<string> {
 
     const streamText = latin1Decode(inflated);
     const extracted = extractTextOperators(streamText);
+    const fallbackExtracted = extracted.trim() ? extracted : extractPrintableFragments(streamText);
 
-    if (extracted.trim()) {
-      chunks.push(extracted);
+    if (fallbackExtracted.trim()) {
+      chunks.push(fallbackExtracted);
     }
   }
 
@@ -96,16 +97,31 @@ export function detectIssuerFromText(text: string, fileName = ""):
 
 export function parseVisaSantanderStatement(text: string): ParsedCardStatementPreview {
   const warnings: string[] = [];
-  const holder = detectHolder(text, [/TITULAR DE CUENTA:\s*([^\n]+)/i, /\b([A-Z][A-Z\s]{8,})\nCAMPILLO/i], warnings, "holder");
+  const holder = detectHolder(
+    text,
+    [/TITULAR DE CUENTA:\s*([^\n]+)/i, /\b([A-Z][A-Z\s]{8,})\nCAMPILLO/i, /\n([A-Z][A-Z\s]{8,})\s*\nJUAN DEL CAMPILLO/i],
+    warnings,
+    "holder"
+  );
   const closingDate = detectDate(text, [/CIERRE ACTUAL:\s*([^\n]+)/i, /CIERRE\s+(\d{1,2}\s+[A-Za-z]{3}\.?\s+\d{2,4})/i], warnings, "closingDate");
   const dueDate = detectDate(text, [/VENCIMIENTO ACTUAL:\s*([^\n]+)/i, /VENCIMIENTO\s+(\d{1,2}\s+[A-Za-z]{3}\.?\s+\d{2,4})/i], warnings, "dueDate");
-  const nextDueDate = detectDate(text, [/PROXIMO VTO\.?\s*([^\n]+)/i], warnings, "nextDueDate");
-  const totalAmount = detectAmount(text, [/SALDO ACTUAL:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
-  const minimumPayment = detectAmount(text, [/PAGO M.{0,4}NIMO:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
-  const projections = parseBnaStyleProjections(text);
+  const nextDueDate = detectVisaSantanderNextDueDate(text, warnings);
+  const amountAnalysis = detectVisaSantanderAmounts(text);
+  const totalAmount = amountAnalysis.totalAmount.value;
+  const minimumPayment = amountAnalysis.minimumPayment.value;
+  const projectionAnalysis = parseBnaStyleProjections(text);
+  const projections = projectionAnalysis.projections;
+
+  if (totalAmount <= 0) {
+    warnings.push('Field "totalAmount" could not be detected.');
+  }
+
+  if (minimumPayment <= 0) {
+    warnings.push('Field "minimumPayment" could not be detected.');
+  }
 
   if (projections.length === 0) {
-    warnings.push("No monthly projections were detected in the Santander Visa statement.");
+    warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Visa Santander.");
   }
 
   return {
@@ -119,11 +135,20 @@ export function parseVisaSantanderStatement(text: string): ParsedCardStatementPr
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: {
-      parser: "parseVisaSantanderStatement",
-      projectionsFound: projections.length,
-      compactTextSample: compactForDetection(text).slice(0, 200)
-    },
+    rawDetectedData: buildParserDebug(
+      "parseVisaSantanderStatement",
+      text,
+      warnings,
+      { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment },
+      projections,
+      projectionAnalysis.candidateBlocks,
+      {
+        amountDetection: {
+          totalAmount: amountAnalysis.totalAmount,
+          minimumPayment: amountAnalysis.minimumPayment
+        }
+      }
+    ),
     warnings
   };
 }
@@ -136,10 +161,11 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
   const nextDueDate = detectDate(text, [/PROXIMO VTO\.?\s*([^\n]+)/i], warnings, "nextDueDate");
   const totalAmount = detectAmount(text, [/SALDO ACTUAL:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
   const minimumPayment = detectAmount(text, [/PAGO M.{0,4}NIMO:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
-  const projections = parseBnaStyleProjections(text);
+  const projectionAnalysis = parseBnaStyleProjections(text);
+  const projections = projectionAnalysis.projections;
 
   if (projections.length === 0) {
-    warnings.push("No monthly projections were detected in the Visa BNA statement.");
+    warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Visa BNA.");
   }
 
   return {
@@ -153,27 +179,29 @@ export function parseVisaBnaStatement(text: string): ParsedCardStatementPreview 
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: {
-      parser: "parseVisaBnaStatement",
-      projectionsFound: projections.length,
-      compactTextSample: compactForDetection(text).slice(0, 200)
-    },
+    rawDetectedData: buildParserDebug("parseVisaBnaStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
     warnings
   };
 }
 
 export function parseMastercardBnaStatement(text: string): ParsedCardStatementPreview {
   const warnings: string[] = [];
-  const holder = detectHolder(text, [/CUIT Entidad:[\s\S]{0,120}\n([A-Z][A-Z\s]{8,})\nCAMPILLO/i], warnings, "holder");
+  const holder = detectHolder(
+    text,
+    [/TOTAL TITULAR\s+([A-Z][A-Z\s]{6,})/i, /CUIT Entidad:[\s\S]{0,120}\n([A-Z][A-Z\s]{8,})\nCAMPILLO/i, /\n([A-Z][A-Z\s]{8,})\nCAMPILLO/i],
+    warnings,
+    "holder"
+  );
   const closingDate = detectDate(text, [/Estado de cuenta al:\s*([^\n]+)/i], warnings, "closingDate");
   const dueDate = detectDate(text, [/Vencimiento actual:\s*([^\n]+)/i], warnings, "dueDate");
-  const nextDueDate = detectDate(text, [/Pr.{0,3}ximo Vencimiento:\s*([^\n]+)/i], warnings, "nextDueDate");
+  const nextDueDate = detectDate(text, [/Pr[\s\S]{0,12}?ximo Vencimiento:\s*([^\n]+)/i], warnings, "nextDueDate");
   const totalAmount = detectAmount(text, [/Saldo actual:\s*\$?\s*([\d\.\,]+)/i], warnings, "totalAmount");
-  const minimumPayment = detectAmount(text, [/Pago M.{0,4}nimo:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
-  const projections = parseBnaStyleProjections(text);
+  const minimumPayment = detectAmount(text, [/Pago[\s\S]{0,16}?nimo:\s*\$?\s*([\d\.\,]+)/i], warnings, "minimumPayment");
+  const projectionAnalysis = parseMastercardBnaProjections(text, dueDate);
+  const projections = projectionAnalysis.projections;
 
   if (projections.length === 0) {
-    warnings.push("No monthly projections were detected in the Mastercard BNA statement.");
+    warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Mastercard BNA.");
   }
 
   return {
@@ -187,18 +215,14 @@ export function parseMastercardBnaStatement(text: string): ParsedCardStatementPr
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: {
-      parser: "parseMastercardBnaStatement",
-      projectionsFound: projections.length,
-      compactTextSample: compactForDetection(text).slice(0, 200)
-    },
+    rawDetectedData: buildParserDebug("parseMastercardBnaStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
     warnings
   };
 }
 
 export function parseNaranjaXStatement(text: string): ParsedCardStatementPreview {
   const warnings: string[] = [];
-  const holder = detectHolder(text, [/^([A-Z][A-Z\s]{8,})$/m], warnings, "holder");
+  const holder = detectHolder(text, [/NARANJA(?:\s+X)?\s+([A-Z][A-Z\s]{6,})/i, /^([A-Z][A-Z\s]{8,})$/m], warnings, "holder");
   const closingDate = detectDate(text, [/El resumen actual cerr[oó] el\s*([0-9]{2}\/[0-9]{2})/i], warnings, "closingDate", {
     inferYearFrom: detectDate(text, [/y vence el\s*([0-9]{2}\/[0-9]{2}\/[0-9]{2,4})/i], [], "dueDate")
   });
@@ -214,7 +238,8 @@ export function parseNaranjaXStatement(text: string): ParsedCardStatementPreview
     warnings,
     "minimumPayment"
   );
-  const projections = parseNaranjaProjections(text);
+  const projectionAnalysis = parseNaranjaProjections(text, dueDate);
+  const projections = projectionAnalysis.projections;
 
   if (projections.length === 0) {
     warnings.push("No monthly projections were detected in the Naranja X statement.");
@@ -231,11 +256,70 @@ export function parseNaranjaXStatement(text: string): ParsedCardStatementPreview
     totalAmount,
     minimumPayment,
     projections,
-    rawDetectedData: {
-      parser: "parseNaranjaXStatement",
-      projectionsFound: projections.length,
-      compactTextSample: compactForDetection(text).slice(0, 200)
-    },
+    rawDetectedData: buildParserDebug("parseNaranjaXStatement", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
+    warnings
+  };
+}
+
+function parseNaranjaXStatementV2(text: string): ParsedCardStatementPreview {
+  const warnings: string[] = [];
+  const holder = detectHolder(text, [/NARANJA(?:\s+X)?\s+([A-Z][A-Z\s]{6,})/i, /^([A-Z][A-Z\s]{8,})$/m], warnings, "holder");
+  const closingDate = detectDate(
+    text,
+    [/El resumen actual cerr[oÃ³]\s+el\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i, /cierre(?: del resumen)?\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i],
+    warnings,
+    "closingDate",
+    {
+      inferYearFrom: detectDate(text, [/y vence el\s*([0-9]{2}\/[0-9]{2}\/[0-9]{2,4})/i], [], "dueDate")
+    }
+  );
+  const dueDate = detectDate(
+    text,
+    [/Tu total a pagar es[\s\S]{0,80}?vence(?: el)?\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i, /vencimiento(?: del resumen)?\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i, /vence(?: el)?\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i],
+    warnings,
+    "dueDate"
+  );
+  const nextDueDate = detectDate(
+    text,
+    [/El pr.{0,4}ximo resumen cierra[\s\S]{0,80}?vence(?: el)?\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i, /pr.{0,4}ximo vencimiento\s*([0-9]{2}\/[0-9]{2}(?:\/[0-9]{2,4})?)/i],
+    warnings,
+    "nextDueDate",
+    {
+      fromAfterKeyword: "El pr",
+      inferYearFrom: closingDate
+    }
+  );
+  const totalAmount = detectAmount(
+    text,
+    [/Tu total a pagar es \$\s*([\d\.\,]+)/i, /total a pagar\s*\$?\s*([\d\.\,]+)/i, /^Total\s*\$?\s*([\d\.\,]+)/im, /saldo actual\s*\$?\s*([\d\.\,]+)/i],
+    warnings,
+    "totalAmount"
+  );
+  const minimumPayment = detectAmount(
+    text,
+    [/PAGO M.{0,10}NIMO:\s*\$?\s*([\d\.\,]+)/i, /LA MENOR ENTREGA\s*\$?\s*([\d\.\,]+)/i, /pago para no generar intereses\s*\$?\s*([\d\.\,]+)/i],
+    warnings,
+    "minimumPayment"
+  );
+  const projectionAnalysis = parseNaranjaProjections(text, dueDate);
+  const projections = projectionAnalysis.projections;
+
+  if (projections.length === 0) {
+    warnings.push("No se detectó una tabla confiable de cuotas futuras en el resumen Naranja X.");
+  }
+
+  return {
+    issuer: "Naranja X",
+    brand: "Naranja X",
+    bank: "Naranja X",
+    holder,
+    closingDate,
+    dueDate,
+    nextDueDate,
+    totalAmount,
+    minimumPayment,
+    projections,
+    rawDetectedData: buildParserDebug("parseNaranjaXStatementV2", text, warnings, { holder, closingDate, dueDate, nextDueDate, totalAmount, minimumPayment }, projections, projectionAnalysis.candidateBlocks),
     warnings
   };
 }
@@ -250,7 +334,7 @@ export function parseDetectedStatement(text: string, fileName = ""): ParsedCardS
       case "mastercard-bna":
         return normalizeParsedPreview(parseMastercardBnaStatement(text));
       case "naranja-x":
-        return normalizeParsedPreview(parseNaranjaXStatement(text));
+        return normalizeParsedPreview(parseNaranjaXStatementV2(text));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown parser error";
@@ -475,22 +559,64 @@ async function inflateBytes(input: Uint8Array): Promise<Uint8Array> {
 function extractTextOperators(streamText: string): string {
   const chunks: string[] = [];
 
-  for (const match of streamText.matchAll(/\((?:\\.|[^\\)])*\)\s*Tj/g)) {
-    chunks.push(decodePdfStringToken(match[0]));
+  for (const match of streamText.matchAll(/(\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]+>)\s*Tj/g)) {
+    chunks.push(decodePdfTextToken(match[1]));
   }
 
   for (const match of streamText.matchAll(/\[((?:.|\n)*?)\]\s*TJ/g)) {
-    for (const inner of match[1].matchAll(/\((?:\\.|[^\\)])*\)/g)) {
-      chunks.push(decodePdfStringToken(inner[0]));
+    for (const inner of match[1].matchAll(/(\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]+>)/g)) {
+      chunks.push(decodePdfTextToken(inner[1]));
     }
+  }
+
+  for (const match of streamText.matchAll(/(\((?:\\.|[^\\)])*\)|<[0-9A-Fa-f\s]+>)\s*['"]/g)) {
+    chunks.push(decodePdfTextToken(match[1]));
   }
 
   return chunks.join("\n");
 }
 
+function decodePdfTextToken(token: string): string {
+  if (token.startsWith("<")) {
+    return decodePdfHexStringToken(token);
+  }
+
+  return decodePdfStringToken(token);
+}
+
 function decodePdfStringToken(token: string): string {
   const inner = token.replace(/\)\s*Tj$|\)\s*$/, "").replace(/^\(/, "");
   return WINDOWS_1252_DECODER.decode(parsePdfLiteralBytes(inner));
+}
+
+function decodePdfHexStringToken(token: string): string {
+  const hex = token.replace(/[<>\s]/g, "");
+
+  if (!hex || hex.length < 2) {
+    return "";
+  }
+
+  const evenHex = hex.length % 2 === 0 ? hex : `${hex}0`;
+  const bytes = hexToBytes(evenHex);
+
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder("utf-16be").decode(bytes.slice(2));
+  }
+
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder("utf-16le").decode(bytes.slice(2));
+  }
+
+  const zeroPrefixedChars = bytes.reduce((count, _, index) => count + (index % 2 === 0 && bytes[index] === 0 ? 1 : 0), 0);
+  if (bytes.length >= 4 && zeroPrefixedChars >= Math.floor(bytes.length / 4)) {
+    try {
+      return new TextDecoder("utf-16be").decode(bytes);
+    } catch {
+      return WINDOWS_1252_DECODER.decode(bytes);
+    }
+  }
+
+  return WINDOWS_1252_DECODER.decode(bytes);
 }
 
 function parsePdfLiteralBytes(value: string): Uint8Array {
@@ -547,6 +673,13 @@ function normalizeExtractedText(text: string): string {
     .trim();
 }
 
+function extractPrintableFragments(streamText: string): string {
+  return Array.from(streamText.matchAll(/[A-Za-zÁÉÍÓÚÑáéíóú0-9$\/.,:%\- ]{6,}/g))
+    .map((match) => collapseSpaces(match[0] ?? ""))
+    .filter((fragment) => /[A-Za-zÁÉÍÓÚÑáéíóú]{3,}/.test(fragment))
+    .join("\n");
+}
+
 function detectHolder(text: string, patterns: RegExp[], warnings: string[], field: string): string {
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -566,10 +699,11 @@ function detectDate(
   field: string,
   options?: { inferYearFrom?: string; fromAfterKeyword?: string }
 ): string {
+  const baseText = text.replace(/[\u0000-\u001f]+/g, " ");
   const candidateText =
     options?.fromAfterKeyword && text.includes(options.fromAfterKeyword)
-      ? text.slice(text.indexOf(options.fromAfterKeyword))
-      : text;
+      ? baseText.slice(baseText.indexOf(options.fromAfterKeyword))
+      : baseText;
 
   for (const pattern of patterns) {
     const match = candidateText.match(pattern);
@@ -586,8 +720,9 @@ function detectDate(
 }
 
 function detectAmount(text: string, patterns: RegExp[], warnings: string[], field: string): number {
+  const candidateText = text.replace(/[\u0000-\u001f]+/g, " ");
   for (const pattern of patterns) {
-    const match = text.match(pattern);
+    const match = candidateText.match(pattern);
     if (match?.[1]) {
       return parseAmount(match[1]);
     }
@@ -597,41 +732,404 @@ function detectAmount(text: string, patterns: RegExp[], warnings: string[], fiel
   return 0;
 }
 
-function parseBnaStyleProjections(text: string): ParsedCardStatementPreview["projections"] {
-  const compact = compactForDetection(text);
-  const sections = ["CUOTASAVENCER", "CUOTASAVENCE", "CUOTASA VENCER".replace(/\s+/g, "")];
-  const start = sections.map((label) => compact.indexOf(label)).find((index) => index >= 0) ?? -1;
+type AmountDetectionCandidate = {
+  rule: string;
+  value: number;
+  snippet: string;
+};
 
-  if (start === -1) {
-    return [];
-  }
+type AmountDetectionResult = {
+  value: number;
+  matchedRule: string;
+  candidates: AmountDetectionCandidate[];
+};
 
-  const slice = compact.slice(start, start + 600);
-  const monthMatches = Array.from(slice.matchAll(MONTH_TOKEN_REGEX)).map((match) => ({
-    label: `${titleCaseMonth(match[1])}/${normalizeYearToken(match[2])}`,
-    yearMonth: toYearMonth(match[1], match[2])
-  }));
-  const amounts = Array.from(slice.matchAll(AMOUNT_REGEX)).map((match) => parseAmount(match[1]));
+function detectVisaSantanderAmounts(text: string): {
+  totalAmount: AmountDetectionResult;
+  minimumPayment: AmountDetectionResult;
+} {
+  const normalizedText = text.replace(/[\u0000-\u001f]+/g, " ");
+  const totalCandidates = dedupeAmountCandidates([
+    ...collectRegexAmountCandidates(normalizedText, [
+      {
+        rule: "debitaremos-cuenta-corriente",
+        pattern: /DEBITAREMOS[\s\S]{0,120}?LA SUMA DE\s*\$\s*([\d\.\,]+)/i
+      },
+      {
+        rule: "saldo-actual-inline",
+        pattern: /SALDO ACTUAL[\s\S]{0,40}?\$\s*([\d\.\,]+)/i
+      },
+      {
+        rule: "saldo-actual-columna",
+        pattern: /Saldo actual:\s*\$\s*([\d\.\,]+)/i
+      }
+    ]),
+    ...collectNearbyLabelAmountCandidates(normalizedText, /SALDO ACTUAL/i, "saldo-actual-window", "max-before")
+  ]);
+  const minimumCandidates = dedupeAmountCandidates([
+    ...collectRegexAmountCandidates(normalizedText, [
+      {
+        rule: "plan-v-pago-minimo",
+        pattern: /Plan V:[\s\S]{0,120}?pago m.{0,4}nimo de\s*\$\s*([\d\.\,]+)/i
+      },
+      {
+        rule: "pago-minimo-inline",
+        pattern: /PAGO M.{0,4}NIMO[\s\S]{0,40}?\$\s*([\d\.\,]+)/i
+      },
+      {
+        rule: "pago-minimo-plan-texto",
+        pattern: /pago m.{0,4}nimo de\s*\$\s*([\d\.\,]+)/i
+      }
+    ]),
+    ...collectNearbyLabelAmountCandidates(normalizedText, /PAGO M.{0,4}NIMO/i, "pago-minimo-window", "closest-before")
+  ]);
 
-  return monthMatches.slice(0, amounts.length).map((month, index) => ({
-    monthLabel: month.label,
-    yearMonth: month.yearMonth,
-    amount: amounts[index] ?? 0
-  })).filter((item) => isYearMonth(item.yearMonth) && item.amount >= 0);
+  return {
+    totalAmount: selectAmountDetection(totalCandidates),
+    minimumPayment: selectAmountDetection(minimumCandidates)
+  };
 }
 
-function parseNaranjaProjections(text: string): ParsedCardStatementPreview["projections"] {
-  const projections: ParsedCardStatementPreview["projections"] = [];
+function detectVisaSantanderNextDueDate(text: string, warnings: string[]): string {
+  const normalizedText = text.replace(/[\u0000-\u001f]+/g, " ");
+  const match =
+    normalizedText.match(/Prox\.?\s*Vto\.?:\s*([0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{2,4})/i) ??
+    normalizedText.match(/Pr[oó]ximo\s+Vto\.?:\s*([0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{2,4})/i);
+  if (match?.[1]) {
+    const parsed = parseLooseDate(match[1]);
+    if (parsed) {
+      return parsed;
+    }
+  }
 
-  for (const match of text.matchAll(/(Mayo|Junio|Julio|Agosto|Septiembre|Setiembre|Octubre|Noviembre|Diciembre|Enero|Febrero|Marzo|Abril)\/(\d{2})\s*\$([\d\.\,]+)/gi)) {
-    projections.push({
-      monthLabel: `${titleCaseMonth(match[1])}/${match[2]}`,
-      yearMonth: toYearMonth(match[1], match[2]),
-      amount: parseAmount(match[3])
+  warnings.push('Field "nextDueDate" could not be detected.');
+  return "";
+}
+
+function collectRegexAmountCandidates(
+  text: string,
+  rules: Array<{ rule: string; pattern: RegExp }>
+): AmountDetectionCandidate[] {
+  const candidates: AmountDetectionCandidate[] = [];
+
+  for (const rule of rules) {
+    const match = text.match(rule.pattern);
+    if (!match?.[1]) {
+      continue;
+    }
+
+    const value = parseAmount(match[1]);
+    if (value <= 0) {
+      continue;
+    }
+
+    candidates.push({
+      rule: rule.rule,
+      value,
+      snippet: collapseSpaces(match[0]).slice(0, 180)
     });
   }
 
-  return projections.filter((item) => isYearMonth(item.yearMonth) && item.amount >= 0);
+  return candidates;
+}
+
+function collectNearbyLabelAmountCandidates(
+  text: string,
+  labelPattern: RegExp,
+  rule: string,
+  strategy: "max-before" | "closest-before"
+): AmountDetectionCandidate[] {
+  const match = text.match(labelPattern);
+  if (!match || match.index == null) {
+    return [];
+  }
+
+  const labelIndex = match.index;
+  const start = Math.max(0, labelIndex - 220);
+  const end = Math.min(text.length, labelIndex + 220);
+  const windowText = text.slice(start, end);
+  const labelOffset = labelIndex - start;
+  const parsed: Array<{ value: number; snippet: string; distance: number; isBefore: boolean }> = [];
+
+  for (const amountMatch of windowText.matchAll(AMOUNT_REGEX)) {
+    const rawValue = amountMatch[1];
+    if (!rawValue) {
+      continue;
+    }
+
+    const value = parseAmount(rawValue);
+    if (value <= 0) {
+      continue;
+    }
+
+    const amountIndex = amountMatch.index ?? 0;
+    parsed.push({
+      value,
+      snippet: collapseSpaces(windowText.slice(Math.max(0, amountIndex - 36), Math.min(windowText.length, amountIndex + 56))),
+      distance: Math.abs(labelOffset - amountIndex),
+      isBefore: amountIndex <= labelOffset
+    });
+  }
+
+  const before = parsed.filter((item) => item.isBefore);
+  if (before.length === 0) {
+    return [];
+  }
+
+  const selected =
+    strategy === "max-before"
+      ? before.reduce((best, item) => (item.value > best.value ? item : best), before[0])
+      : before.reduce((best, item) => (item.distance < best.distance ? item : best), before[0]);
+
+  return [
+    {
+      rule,
+      value: selected.value,
+      snippet: selected.snippet
+    }
+  ];
+}
+
+function dedupeAmountCandidates(candidates: AmountDetectionCandidate[]): AmountDetectionCandidate[] {
+  const seen = new Set<string>();
+  const deduped: AmountDetectionCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const key = `${candidate.rule}:${candidate.value}:${candidate.snippet}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(candidate);
+  }
+
+  return deduped;
+}
+
+function selectAmountDetection(candidates: AmountDetectionCandidate[]): AmountDetectionResult {
+  const selected = candidates[0];
+  return {
+    value: selected?.value ?? 0,
+    matchedRule: selected?.rule ?? "",
+    candidates
+  };
+}
+
+function parseBnaStyleProjections(text: string): {
+  projections: ParsedCardStatementPreview["projections"];
+  candidateBlocks: string[];
+} {
+  return parseProjectionBlocks(text, [/CUOTAS?\s+A\s+VENCER/i], [/RESUMEN CONSOLIDADO/i, /DETALLE DEL/i, /COMPRAS DEL MES/i]);
+}
+
+function parseMastercardBnaProjections(
+  text: string,
+  dueDate: string
+): {
+  projections: ParsedCardStatementPreview["projections"];
+  candidateBlocks: string[];
+} {
+  return parseProjectionBlocks(
+    text,
+    [/CUOTAS?\s+A\s+VENCER/i],
+    [/RESUMEN CONSOLIDADO/i, /DETALLE DEL/i, /COMPRAS DEL MES/i],
+    dueDate
+  );
+}
+
+function parseNaranjaProjections(
+  text: string,
+  dueDate: string
+): {
+  projections: ParsedCardStatementPreview["projections"];
+  candidateBlocks: string[];
+} {
+  const byBlocks = parseProjectionBlocks(
+    text,
+    [/CUOTAS?\s+FUTURAS/i, /PLAN DE PAGOS/i, /PROXIMAS?\s+CUOTAS/i, /CUOTAS?\s+A\s+VENCER/i],
+    [/MOVIMIENTOS/i, /DETALLE/i, /TOTAL A PAGAR/i],
+    dueDate
+  );
+
+  if (byBlocks.projections.length > 0) {
+    return byBlocks;
+  }
+
+  const inferYear = dueDate ? dueDate.slice(0, 4) : "";
+  const fallbackMatches = Array.from(
+    text.matchAll(
+      /(Enero|Febrero|Marzo|Abril|Mayo|Junio|Julio|Agosto|Septiembre|Setiembre|Octubre|Noviembre|Diciembre)(?:\/|-|\s)(\d{2,4})?\s*\$?\s*([\d\.\,]+)/gi
+    )
+  );
+  const projections = dedupeProjections(
+    fallbackMatches
+      .map((match) => {
+        const yearToken = match[2] || inferYear;
+        const yearMonth = toYearMonth(match[1], yearToken);
+        return {
+          monthLabel: `${titleCaseMonth(match[1])}/${normalizeYearToken(yearToken)}`,
+          yearMonth,
+          amount: parseAmount(match[3])
+        };
+      })
+      .filter((item) => isYearMonth(item.yearMonth) && item.amount > 0)
+  );
+
+  return {
+    projections,
+    candidateBlocks: byBlocks.candidateBlocks
+  };
+}
+
+function parseProjectionBlocks(
+  text: string,
+  startPatterns: RegExp[],
+  stopPatterns: RegExp[],
+  inferYearFromDate = ""
+): {
+  projections: ParsedCardStatementPreview["projections"];
+  candidateBlocks: string[];
+} {
+  const candidateBlocks = collectProjectionCandidateBlocks(text, startPatterns, stopPatterns);
+  const minimumYearMonth = inferYearFromDate ? inferYearFromDate.slice(0, 7) : "";
+  const projections = dedupeProjections(
+    candidateBlocks.flatMap((block) => parseProjectionPairsFromBlock(block, inferYearFromDate))
+  ).filter((item) => item.amount > 0 && (!minimumYearMonth || item.yearMonth >= minimumYearMonth));
+
+  return {
+    projections,
+    candidateBlocks
+  };
+}
+
+function collectProjectionCandidateBlocks(text: string, startPatterns: RegExp[], stopPatterns: RegExp[]): string[] {
+  const lines = text
+    .split(/\n+/)
+    .map((line) => collapseSpaces(line))
+    .filter(Boolean);
+  const blocks: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!startPatterns.some((pattern) => pattern.test(lines[index]))) {
+      continue;
+    }
+
+    const blockLines: string[] = [lines[index]];
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      if (stopPatterns.some((pattern) => pattern.test(lines[cursor]))) {
+        break;
+      }
+      if (blockLines.length >= 14) {
+        break;
+      }
+      blockLines.push(lines[cursor]);
+    }
+
+    blocks.push(blockLines.join("\n"));
+  }
+
+  return blocks.slice(0, 4);
+}
+
+function parseProjectionPairsFromBlock(
+  block: string,
+  inferYearFromDate: string
+): ParsedCardStatementPreview["projections"] {
+  const lines = block
+    .split(/\n+/)
+    .map((line) => collapseSpaces(line))
+    .filter(Boolean);
+  const projections: ParsedCardStatementPreview["projections"] = [];
+  const pendingMonths: Array<{ monthLabel: string; yearMonth: string }> = [];
+  const fallbackYear = inferYearFromDate ? inferYearFromDate.slice(0, 4) : String(new Date().getUTCFullYear());
+
+  for (const line of lines) {
+    if (/^(pesos|dolares|fecha|concepto|compras|resumen consolidado|detalle del)/i.test(line)) {
+      continue;
+    }
+
+    const months = parseMonthReferences(line, fallbackYear);
+    const amounts = Array.from(line.matchAll(AMOUNT_REGEX))
+      .map((match) => parseAmount(match[1]))
+      .filter((amount) => amount > 0);
+
+    if (months.length > 0 && amounts.length > 0) {
+      for (let index = 0; index < Math.min(months.length, amounts.length); index += 1) {
+        projections.push({
+          monthLabel: months[index].monthLabel,
+          yearMonth: months[index].yearMonth,
+          amount: amounts[index]
+        });
+      }
+      if (months.length > amounts.length) {
+        pendingMonths.push(...months.slice(amounts.length));
+      }
+      continue;
+    }
+
+    if (months.length > 0) {
+      pendingMonths.push(...months);
+      continue;
+    }
+
+    if (amounts.length > 0 && pendingMonths.length > 0) {
+      for (let index = 0; index < Math.min(pendingMonths.length, amounts.length); index += 1) {
+        projections.push({
+          monthLabel: pendingMonths[index].monthLabel,
+          yearMonth: pendingMonths[index].yearMonth,
+          amount: amounts[index]
+        });
+      }
+      pendingMonths.splice(0, amounts.length);
+    }
+  }
+
+  return projections.filter((item) => isYearMonth(item.yearMonth) && item.amount > 0);
+}
+
+function parseMonthReferences(line: string, fallbackYear: string): Array<{ monthLabel: string; yearMonth: string }> {
+  const results: Array<{ monthLabel: string; yearMonth: string }> = [];
+
+  for (const match of line.matchAll(/(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|SETIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE|ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)(?:\/|-|\s)(\d{2,4})?/gi)) {
+    const yearToken = match[2] || fallbackYear;
+    const yearMonth = toYearMonth(match[1], yearToken);
+    if (!isYearMonth(yearMonth)) {
+      continue;
+    }
+    results.push({
+      monthLabel: `${titleCaseMonth(match[1])}/${normalizeYearToken(yearToken)}`,
+      yearMonth
+    });
+  }
+
+  return results;
+}
+
+function buildParserDebug(
+  parser: string,
+  text: string,
+  warnings: string[],
+  fields: Record<string, string | number>,
+  projections: ParsedCardStatementPreview["projections"],
+  candidateBlocks: string[],
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const fieldsFound = Object.entries(fields)
+    .filter(([, value]) => (typeof value === "number" ? value > 0 : String(value).trim() !== ""))
+    .map(([key]) => key);
+  const missingFields = Object.keys(fields).filter((key) => !fieldsFound.includes(key));
+
+  return {
+    parser,
+    detectedIssuer: parser.replace(/^parse/i, "").replace(/Statement$/, ""),
+    fieldsFound,
+    missingFields,
+    candidateBlocks: candidateBlocks.map((block) => block.slice(0, 280)),
+    projectionsFound: projections.length,
+    warningsCount: warnings.length,
+    compactTextSample: compactForDetection(text).slice(0, 220),
+    ...extra
+  };
 }
 
 function parseLooseDate(input: string, inferYearFrom?: string): string {

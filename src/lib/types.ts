@@ -340,7 +340,7 @@ export interface ParsedCardStatementPreview {
   totalAmount: number;
   minimumPayment: number;
   projections: CardStatementProjectionPreview[];
-  rawDetectedData: Record<string, string | number | boolean | string[]>;
+  rawDetectedData: Record<string, unknown>;
   warnings: string[];
 }
 
@@ -368,8 +368,12 @@ export interface DebugCardStatementResult {
   ok: true;
   summary: CardSummaryRecord;
   projections: InstallmentProjectionRecord[];
+  installments: InstallmentDetailRecord[];
   parsed: ParsedCardStatementPreview;
+  parserDebug: Record<string, unknown>;
 }
+
+export interface CardStatementDetailResult extends DebugCardStatementResult {}
 
 export interface GoogleTokenResponse {
   access_token: string;
