@@ -1,10 +1,19 @@
 import { getGoogleAccessToken } from "./google-auth";
 import { parseNaranjaWithGemini } from "./gemini";
 import { detectIssuerFromText, extractPdfText, parseDetectedStatement } from "./pdf-statements";
+import { generateSalt, hashPassword } from "./auth";
 import {
   ACCOUNTS_PAYABLE_HEADERS,
   ACCOUNTS_PAYABLE_SHEET_NAME,
+  APP_SETTINGS_HEADERS,
+  APP_SETTINGS_SHEET_NAME,
+  APP_USER_HEADERS,
+  APP_USER_SHEET_NAME,
   AppError,
+  type AppBrandingSettings,
+  type AppSettingsRecord,
+  type AppUserRecord,
+  type AppUserRole,
   BUDGET_HEADERS,
   BUDGET_SHEET_NAME,
   BUSINESS_REIMBURSEMENT_HEADERS,
@@ -44,6 +53,7 @@ import {
   type PayableStatus,
   type ParsedCardStatementPreview,
   type ReimbursementStatus,
+  type SessionUser,
   type SheetSnapshot,
   type TransactionRecord,
   type UploadedCardStatementResult
@@ -81,7 +91,9 @@ const MODULE_SHEETS: ModuleSheetConfig[] = [
   { sheetName: INSTALLMENT_DETAIL_SHEET_NAME, headers: INSTALLMENT_DETAIL_HEADERS },
   { sheetName: BUSINESS_REIMBURSEMENT_SHEET_NAME, headers: BUSINESS_REIMBURSEMENT_HEADERS },
   { sheetName: ACCOUNTS_PAYABLE_SHEET_NAME, headers: ACCOUNTS_PAYABLE_HEADERS },
-  { sheetName: BUDGET_SHEET_NAME, headers: BUDGET_HEADERS }
+  { sheetName: BUDGET_SHEET_NAME, headers: BUDGET_HEADERS },
+  { sheetName: APP_USER_SHEET_NAME, headers: APP_USER_HEADERS },
+  { sheetName: APP_SETTINGS_SHEET_NAME, headers: APP_SETTINGS_HEADERS }
 ];
 
 export async function initializeFinanceModuleSheets(env: Env): Promise<FinanceModuleSetupResult> {
@@ -1431,6 +1443,218 @@ export async function duplicateBudgetsFromMonth(
   return { sourceMonthYear: input.sourceMonthYear, targetMonthYear: input.targetMonthYear, created, skipped };
 }
 
+export async function listAppUsers(env: Env): Promise<AppUserRecord[]> {
+  const snapshot = await readModuleSheet(env, APP_USER_SHEET_NAME, APP_USER_HEADERS);
+  return snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToAppUser(snapshot.headers, row))
+    .sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+export async function getAppUserByUsername(env: Env, username: string): Promise<AppUserRecord | null> {
+  const normalized = normalizeForMatch(username);
+  const users = await listAppUsers(env);
+  return users.find((user) => normalizeForMatch(user.username) === normalized) ?? null;
+}
+
+export async function getAppUserById(env: Env, userId: string): Promise<AppUserRecord | null> {
+  const snapshot = await readModuleSheet(env, APP_USER_SHEET_NAME, APP_USER_HEADERS);
+  const match = findRowByKey(snapshot, "userId", userId.trim());
+  return match ? rowToAppUser(snapshot.headers, match.row) : null;
+}
+
+export async function verifyAppUserCredentials(
+  env: Env,
+  username: string,
+  password: string
+): Promise<SessionUser | null> {
+  const user = await getAppUserByUsername(env, username);
+
+  if (!user || !user.active) {
+    return null;
+  }
+
+  const computedHash = await hashPassword(password, user.passwordSalt);
+  if (computedHash !== user.passwordHash) {
+    return null;
+  }
+
+  return toSessionUser(user);
+}
+
+export async function bootstrapDefaultUsers(
+  env: Env,
+  input: {
+    leandroPassword: string;
+    johanaPassword: string;
+    leandroDisplayName?: string;
+    johanaDisplayName?: string;
+  }
+): Promise<AppUserRecord[]> {
+  const existing = await listAppUsers(env);
+  if (existing.length > 0) {
+    throw new AppError("validate", "Bootstrap already completed.", undefined, 409);
+  }
+
+  const users: AppUserRecord[] = [];
+  users.push(
+    await createAppUser(env, {
+      username: "leandro",
+      displayName: input.leandroDisplayName || "Leandro",
+      role: "superadmin",
+      password: input.leandroPassword,
+      active: true
+    })
+  );
+  users.push(
+    await createAppUser(env, {
+      username: "johana",
+      displayName: input.johanaDisplayName || "Johana",
+      role: "user",
+      password: input.johanaPassword,
+      active: true
+    })
+  );
+
+  return users;
+}
+
+export async function createAppUser(
+  env: Env,
+  input: {
+    username: string;
+    displayName: string;
+    role?: AppUserRole;
+    password: string;
+    active?: boolean;
+  }
+): Promise<AppUserRecord> {
+  const snapshot = await readModuleSheet(env, APP_USER_SHEET_NAME, APP_USER_HEADERS);
+  const username = stringValue(input.username);
+  if (!username) {
+    throw new AppError("validate", 'Field "username" is required.', undefined, 400);
+  }
+
+  const exists = snapshot.rows
+    .map((row) => rowToAppUser(snapshot.headers, row))
+    .some((user) => normalizeForMatch(user.username) === normalizeForMatch(username));
+
+  if (exists) {
+    throw new AppError("validate", "Username already exists.", undefined, 409);
+  }
+
+  const salt = generateSalt();
+  const now = new Date().toISOString();
+  const record: AppUserRecord = {
+    userId: generateId("user"),
+    username,
+    displayName: stringValue(input.displayName) || username,
+    role: normalizeUserRole(input.role),
+    passwordHash: await hashPassword(input.password, salt),
+    passwordSalt: salt,
+    active: booleanValue(input.active, true),
+    createdAt: now,
+    updatedAt: now
+  };
+
+  await appendRow(env, APP_USER_SHEET_NAME, snapshot.headers, record);
+  return record;
+}
+
+export async function updateAppUser(
+  env: Env,
+  userId: string,
+  input: {
+    username?: string;
+    displayName?: string;
+    role?: AppUserRole;
+    password?: string;
+    active?: boolean;
+  }
+): Promise<AppUserRecord | null> {
+  const snapshot = await readModuleSheet(env, APP_USER_SHEET_NAME, APP_USER_HEADERS);
+  const match = findRowByKey(snapshot, "userId", userId.trim());
+
+  if (!match) {
+    return null;
+  }
+
+  const current = rowToAppUser(snapshot.headers, match.row);
+  let nextSalt = current.passwordSalt;
+  let nextHash = current.passwordHash;
+
+  if (input.password && stringValue(input.password)) {
+    nextSalt = generateSalt();
+    nextHash = await hashPassword(input.password, nextSalt);
+  }
+
+  const updated: AppUserRecord = {
+    ...current,
+    username: input.username ? stringValue(input.username) : current.username,
+    displayName: input.displayName ? stringValue(input.displayName) : current.displayName,
+    role: input.role ? normalizeUserRole(input.role) : current.role,
+    passwordHash: nextHash,
+    passwordSalt: nextSalt,
+    active: typeof input.active === "boolean" ? input.active : current.active,
+    updatedAt: new Date().toISOString()
+  };
+
+  await updateRow(env, APP_USER_SHEET_NAME, snapshot.headers, match.index, updated);
+  return updated;
+}
+
+export async function getBrandingSettings(env: Env): Promise<AppBrandingSettings> {
+  const records = await listAppSettings(env);
+  const map = records.reduce<Record<string, string>>((acc, item) => {
+    acc[item.settingKey] = item.settingValue;
+    return acc;
+  }, {});
+
+  return {
+    appName: map.appName || "FinanzasHogar",
+    logoUrl: map.logoUrl || ""
+  };
+}
+
+export async function updateBrandingSettings(
+  env: Env,
+  input: { appName?: string; logoUrl?: string }
+): Promise<AppBrandingSettings> {
+  if ("appName" in input) {
+    await upsertAppSetting(env, "appName", stringValue(input.appName));
+  }
+
+  if ("logoUrl" in input) {
+    await upsertAppSetting(env, "logoUrl", stringValue(input.logoUrl));
+  }
+
+  return getBrandingSettings(env);
+}
+
+async function listAppSettings(env: Env): Promise<AppSettingsRecord[]> {
+  const snapshot = await readModuleSheet(env, APP_SETTINGS_SHEET_NAME, APP_SETTINGS_HEADERS);
+  return snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToAppSetting(snapshot.headers, row));
+}
+
+async function upsertAppSetting(env: Env, settingKey: string, settingValue: string): Promise<void> {
+  const snapshot = await readModuleSheet(env, APP_SETTINGS_SHEET_NAME, APP_SETTINGS_HEADERS);
+  const match = findRowByKey(snapshot, "settingKey", settingKey);
+  const record: AppSettingsRecord = {
+    settingKey,
+    settingValue,
+    updatedAt: new Date().toISOString()
+  };
+
+  if (match) {
+    await updateRow(env, APP_SETTINGS_SHEET_NAME, snapshot.headers, match.index, record);
+    return;
+  }
+
+  await appendRow(env, APP_SETTINGS_SHEET_NAME, snapshot.headers, record);
+}
+
 export async function getCardsDashboard(env: Env, yearMonth = currentYearMonthString()): Promise<CardsDashboardResponse> {
   const cards = await listCards(env);
   const statements = await listCardSummaries(env);
@@ -2339,6 +2563,41 @@ function rowToBudget(headers: string[], row: string[]): BudgetRecord {
   };
 }
 
+function rowToAppUser(headers: string[], row: string[]): AppUserRecord {
+  const record = rowToObject(headers, row);
+  return {
+    ...record,
+    userId: stringValue(record.userId),
+    username: stringValue(record.username),
+    displayName: stringValue(record.displayName),
+    role: normalizeUserRole(record.role),
+    passwordHash: stringValue(record.passwordHash),
+    passwordSalt: stringValue(record.passwordSalt),
+    active: booleanValue(record.active, true),
+    createdAt: stringValue(record.createdAt),
+    updatedAt: stringValue(record.updatedAt)
+  };
+}
+
+function rowToAppSetting(headers: string[], row: string[]): AppSettingsRecord {
+  const record = rowToObject(headers, row);
+  return {
+    ...record,
+    settingKey: stringValue(record.settingKey),
+    settingValue: stringValue(record.settingValue),
+    updatedAt: stringValue(record.updatedAt)
+  };
+}
+
+function toSessionUser(user: AppUserRecord): SessionUser {
+  return {
+    userId: user.userId,
+    username: user.username,
+    displayName: user.displayName,
+    role: user.role
+  };
+}
+
 function rowToObject(headers: string[], row: string[]): Record<string, string> {
   return headers.reduce<Record<string, string>>((result, header, index) => {
     result[header] = normalizeCell(row[index]);
@@ -2817,6 +3076,10 @@ function normalizeCurrency(value: unknown): "ARS" | "USD" {
 
 function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {
   return value === "pending" || value === "partial" || value === "paid" ? value : null;
+}
+
+function normalizeUserRole(value: unknown): AppUserRole {
+  return stringValue(value).toLowerCase() === "superadmin" ? "superadmin" : "user";
 }
 
 function boundedDay(value: unknown): number {

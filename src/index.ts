@@ -1,7 +1,11 @@
-import { Hono } from "hono";
+import { Context, Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { createSessionToken, SESSION_COOKIE_NAME, sessionMaxAgeSeconds, verifySessionToken } from "./lib/auth";
 import { runParserSmokeTests } from "./lib/pdf-statements";
 import {
+  bootstrapDefaultUsers,
   createAccountPayable,
+  createAppUser,
   createBusinessReimbursement,
   createCard,
   createCardSummary,
@@ -14,8 +18,11 @@ import {
   getCardsDashboard,
   getCardStatement,
   getCardStatementDetail,
+  getBrandingSettings,
+  getAppUserById,
   getInstallmentForecast,
   initializeFinanceModuleSheets,
+  listAppUsers,
   listAccountsPayable,
   listBusinessReimbursements,
   listBudgets,
@@ -28,12 +35,15 @@ import {
   registerReimbursementPayment,
   summarizeBudgets,
   uploadCardStatementPdf,
+  updateAppUser,
+  updateBrandingSettings,
   updateAccountPayable,
   updateBudget,
   updateBusinessReimbursement,
   updateCard,
   updateCardStatement,
-  updateInstallmentDetail
+  updateInstallmentDetail,
+  verifyAppUserCredentials
 } from "./lib/finance-modules";
 import {
   createTransaction,
@@ -44,17 +54,19 @@ import {
 } from "./lib/sheets";
 import type {
   AppErrorStep,
+  AppUserRole,
   InstallmentFilters,
   OwnerType,
   ReimbursementStatus,
   CreateTransactionInput,
   Env,
+  SessionUser,
   TransactionType,
   UpdateTransactionInput
 } from "./lib/types";
 import { AppError, DEFAULT_HEADERS, SHEET_NAME } from "./lib/types";
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: { sessionUser: SessionUser } }>();
 
 app.get("/", async (c) => {
   return c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
@@ -62,6 +74,133 @@ app.get("/", async (c) => {
 
 app.get("/health", (c) => {
   return c.json({ ok: true });
+});
+
+app.get("/api/auth/session", async (c) => {
+  const [users, branding] = await Promise.all([listAppUsers(c.env), getBrandingSettings(c.env)]);
+  const sessionUser = await readSessionUser(c);
+
+  return c.json({
+    ok: true,
+    authenticated: Boolean(sessionUser),
+    needsBootstrap: users.length === 0,
+    user: sessionUser,
+    branding
+  });
+});
+
+app.post("/api/auth/bootstrap", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const leandroPassword = stringField(payload.leandroPassword);
+  const johanaPassword = stringField(payload.johanaPassword);
+
+  if (!leandroPassword || !johanaPassword) {
+    return c.json({ error: 'Fields "leandroPassword" and "johanaPassword" are required.' }, 400);
+  }
+
+  try {
+    const createdUsers = await bootstrapDefaultUsers(c.env, {
+      leandroPassword,
+      johanaPassword,
+      leandroDisplayName: stringField(payload.leandroDisplayName) || "Leandro",
+      johanaDisplayName: stringField(payload.johanaDisplayName) || "Johana"
+    });
+    const superadmin = createdUsers.find((user) => user.role === "superadmin");
+
+    if (!superadmin) {
+      throw new Error("Bootstrap did not create a superadmin user.");
+    }
+
+    await writeSessionCookie(c, {
+      userId: superadmin.userId,
+      username: superadmin.username,
+      displayName: superadmin.displayName,
+      role: superadmin.role
+    });
+
+    return c.json({
+      ok: true,
+      user: {
+        userId: superadmin.userId,
+        username: superadmin.username,
+        displayName: superadmin.displayName,
+        role: superadmin.role
+      },
+      users: createdUsers.map(toPublicUser),
+      branding: await getBrandingSettings(c.env)
+    });
+  } catch (error) {
+    const appError = toAppError(error, "validate");
+    return c.json({ ok: false, error: appError.message }, appError.status === 409 ? 409 : 400);
+  }
+});
+
+app.post("/api/auth/login", async (c) => {
+  const payload = await safeJson(c);
+
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const username = stringField(payload.username);
+  const password = stringField(payload.password);
+
+  if (!username || !password) {
+    return c.json({ error: 'Fields "username" and "password" are required.' }, 400);
+  }
+
+  const user = await verifyAppUserCredentials(c.env, username, password);
+  if (!user) {
+    return c.json({ error: "Invalid credentials." }, 401);
+  }
+
+  await writeSessionCookie(c, user);
+
+  return c.json({
+    ok: true,
+    user,
+    branding: await getBrandingSettings(c.env)
+  });
+});
+
+app.post("/api/auth/logout", async (c) => {
+  deleteCookie(c, SESSION_COOKIE_NAME, { path: "/" });
+  return c.json({ ok: true });
+});
+
+app.use("/api/*", async (c, next) => {
+  if (
+    c.req.path === "/api/auth/session" ||
+    c.req.path === "/api/auth/login" ||
+    c.req.path === "/api/auth/logout" ||
+    c.req.path === "/api/auth/bootstrap"
+  ) {
+    await next();
+    return;
+  }
+
+  const sessionUser = await readSessionUser(c);
+  if (!sessionUser) {
+    return c.json({ ok: false, error: "AUTH_REQUIRED", message: "Necesitás iniciar sesión." }, 401);
+  }
+
+  c.set("sessionUser", sessionUser);
+  await next();
+});
+
+app.use("/debug/*", async (c, next) => {
+  const sessionUser = await readSessionUser(c);
+  if (!sessionUser) {
+    return c.json({ ok: false, error: "AUTH_REQUIRED", message: "Necesitás iniciar sesión." }, 401);
+  }
+
+  c.set("sessionUser", sessionUser);
+  await next();
 });
 
 app.get("/api/transactions", async (c) => {
@@ -741,6 +880,104 @@ app.post("/api/budgets/duplicate-previous-month", async (c) => {
   return c.json({ ok: true, ...result });
 });
 
+app.get("/api/users", async (c) => {
+  const guard = requireSuperadmin(c);
+  if (guard) {
+    return guard;
+  }
+
+  const users = await listAppUsers(c.env);
+  return c.json(users.map(toPublicUser));
+});
+
+app.post("/api/users", async (c) => {
+  const guard = requireSuperadmin(c);
+  if (guard) {
+    return guard;
+  }
+
+  const payload = await safeJson(c);
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const username = stringField(payload.username);
+  const displayName = stringField(payload.displayName);
+  const password = stringField(payload.password);
+  const role = parseUserRole(payload.role);
+
+  if (!username || !displayName || !password) {
+    return c.json({ error: 'Fields "username", "displayName" and "password" are required.' }, 400);
+  }
+
+  const user = await createAppUser(c.env, {
+    username,
+    displayName,
+    password,
+    role: role ?? "user",
+    active: payload.active !== false
+  });
+
+  return c.json(toPublicUser(user), 201);
+});
+
+app.patch("/api/users/:id", async (c) => {
+  const guard = requireSuperadmin(c);
+  if (guard) {
+    return guard;
+  }
+
+  const payload = await safeJson(c);
+  const userId = c.req.param("id").trim();
+
+  if (!payload || !userId) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const role = "role" in payload ? parseUserRole(payload.role) : undefined;
+  const user = await updateAppUser(c.env, userId, {
+    username: "username" in payload ? stringField(payload.username) : undefined,
+    displayName: "displayName" in payload ? stringField(payload.displayName) : undefined,
+    password: "password" in payload ? stringField(payload.password) : undefined,
+    role: role ?? undefined,
+    active: "active" in payload ? Boolean(payload.active) : undefined
+  });
+
+  if (!user) {
+    return c.json({ error: "User not found." }, 404);
+  }
+
+  return c.json(toPublicUser(user));
+});
+
+app.get("/api/settings", async (c) => {
+  const sessionUser = c.get("sessionUser");
+  return c.json({
+    ok: true,
+    user: sessionUser,
+    branding: await getBrandingSettings(c.env)
+  });
+});
+
+app.patch("/api/settings/branding", async (c) => {
+  const guard = requireSuperadmin(c);
+  if (guard) {
+    return guard;
+  }
+
+  const payload = await safeJson(c);
+  if (!payload) {
+    return c.json({ error: "Invalid JSON body." }, 400);
+  }
+
+  const branding = await updateBrandingSettings(c.env, {
+    appName: "appName" in payload ? stringField(payload.appName) : undefined,
+    logoUrl: "logoUrl" in payload ? stringField(payload.logoUrl) : undefined
+  });
+
+  return c.json({ ok: true, branding });
+});
+
 app.notFound(async (c) => {
   if (c.req.method === "GET" && !c.req.path.startsWith("/api/")) {
     return c.env.ASSETS.fetch(new URL("/index.html", c.req.url));
@@ -1252,6 +1489,87 @@ function parseOwnerType(value: unknown): OwnerType | null {
 
 function parseReimbursementStatus(value: unknown): ReimbursementStatus | null {
   return value === "pending" || value === "partial" || value === "paid" ? value : null;
+}
+
+function parseUserRole(value: unknown): AppUserRole | null {
+  return value === "superadmin" || value === "user" ? value : null;
+}
+
+function toPublicUser(user: {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: AppUserRole;
+  active: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}) {
+  return {
+    userId: user.userId,
+    username: user.username,
+    displayName: user.displayName,
+    role: user.role,
+    active: user.active,
+    createdAt: user.createdAt ?? "",
+    updatedAt: user.updatedAt ?? ""
+  };
+}
+
+async function readSessionUser(
+  c: Context<{ Bindings: Env; Variables: { sessionUser: SessionUser } }>
+): Promise<SessionUser | null> {
+  const token = getCookie(c, SESSION_COOKIE_NAME);
+  if (!token) {
+    return null;
+  }
+
+  const sessionUser = await verifySessionToken(c.env, token);
+  if (!sessionUser) {
+    return null;
+  }
+
+  const persistedUser = await getAppUserById(c.env, sessionUser.userId);
+  if (!persistedUser || !persistedUser.active) {
+    return null;
+  }
+
+  return {
+    userId: persistedUser.userId,
+    username: persistedUser.username,
+    displayName: persistedUser.displayName,
+    role: persistedUser.role
+  };
+}
+
+async function writeSessionCookie(
+  c: Context<{ Bindings: Env; Variables: { sessionUser: SessionUser } }>,
+  user: SessionUser
+): Promise<void> {
+  const token = await createSessionToken(c.env, user);
+  setCookie(c, SESSION_COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: sessionMaxAgeSeconds()
+  });
+}
+
+function requireSuperadmin(c: {
+  get: (key: "sessionUser") => SessionUser | undefined;
+  json: (body: unknown, status?: number) => Response;
+}): Response | null {
+  const sessionUser = c.get("sessionUser");
+
+  if (!sessionUser) {
+    return c.json({ ok: false, error: "AUTH_REQUIRED", message: "Necesitás iniciar sesión." }, 401);
+  }
+
+  if (sessionUser.role !== "superadmin") {
+    return c.json({ ok: false, error: "FORBIDDEN", message: "Solo Leandro o un superadmin puede hacer esto." }, 403);
+  }
+
+  return null;
 }
 
 function toAppError(error: unknown, fallbackStep: AppErrorStep): AppError {

@@ -115,6 +115,26 @@ export const BUDGET_HEADERS = [
   "createdAt"
 ] as const;
 
+export const APP_USER_SHEET_NAME = "Usuarios";
+export const APP_USER_HEADERS = [
+  "userId",
+  "username",
+  "displayName",
+  "role",
+  "passwordHash",
+  "passwordSalt",
+  "active",
+  "createdAt",
+  "updatedAt"
+] as const;
+
+export const APP_SETTINGS_SHEET_NAME = "AppSettings";
+export const APP_SETTINGS_HEADERS = [
+  "settingKey",
+  "settingValue",
+  "updatedAt"
+] as const;
+
 export const BUSINESS_REIMBURSEMENT_SHEET_NAME = "ReintegrosNegocio";
 export const BUSINESS_REIMBURSEMENT_HEADERS = [
   "reimbursementId",
@@ -138,6 +158,7 @@ export type OwnerType = "personal" | "business" | "mixed" | "Leandro" | "Johana"
 export type ReimbursementStatus = "pending" | "partial" | "paid";
 export type CurrencyCode = "ARS" | "USD";
 export type PayableStatus = "PENDING" | "PARTIAL" | "PAID";
+export type AppUserRole = "superadmin" | "user";
 export type AppErrorStep =
   | "env"
   | "jwt"
@@ -161,7 +182,38 @@ export interface Env {
   SERVICE_ACCOUNT_EMAIL: string;
   PRIVATE_KEY: string;
   GEMINI_API_KEY?: string;
+  SESSION_SECRET?: string;
   ASSETS: AssetFetcher;
+}
+
+export interface AppUserRecord extends Record<string, string | number | boolean> {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: AppUserRole;
+  passwordHash: string;
+  passwordSalt: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionUser {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: AppUserRole;
+}
+
+export interface AppBrandingSettings {
+  appName: string;
+  logoUrl: string;
+}
+
+export interface AppSettingsRecord extends Record<string, string> {
+  settingKey: string;
+  settingValue: string;
+  updatedAt: string;
 }
 
 export interface Transaction {
