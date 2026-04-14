@@ -970,9 +970,23 @@ app.patch("/api/settings/branding", async (c) => {
     return c.json({ error: "Invalid JSON body." }, 400);
   }
 
+  const appName = "appName" in payload ? stringField(payload.appName) : undefined;
+  const logoUrl = "logoUrl" in payload ? stringField(payload.logoUrl) : undefined;
+
+  if (logoUrl && logoUrl.length > 45000) {
+    return c.json(
+      {
+        ok: false,
+        error: "LOGO_TOO_LARGE",
+        message: "El logo es demasiado grande para guardarlo en Google Sheets. Proba con una imagen mas chica."
+      },
+      400
+    );
+  }
+
   const branding = await updateBrandingSettings(c.env, {
-    appName: "appName" in payload ? stringField(payload.appName) : undefined,
-    logoUrl: "logoUrl" in payload ? stringField(payload.logoUrl) : undefined
+    appName,
+    logoUrl
   });
 
   return c.json({ ok: true, branding });
