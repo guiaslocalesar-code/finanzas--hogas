@@ -67,6 +67,20 @@ type ModuleSheetConfig = {
   headers: readonly string[];
 };
 
+type CacheEntry<T> = {
+  expiresAt: number;
+  value?: T;
+  promise?: Promise<T>;
+};
+
+const MODULE_SETUP_CACHE_TTL_MS = 5 * 60 * 1000;
+const SHEET_SNAPSHOT_CACHE_TTL_MS = 8 * 1000;
+const SPREADSHEET_SHEETS_CACHE_TTL_MS = 30 * 1000;
+
+const moduleSetupCache = new Map<string, CacheEntry<ModuleSheetSetupStatus>>();
+const sheetSnapshotCache = new Map<string, CacheEntry<SheetSnapshot>>();
+const spreadsheetSheetsCache = new Map<string, CacheEntry<Array<{ sheetId: number; title: string }>>>();
+
 type ParsedSummaryImport = {
   statementDate: string;
   closingDate: string;
@@ -1620,15 +1634,36 @@ export async function updateBrandingSettings(
   env: Env,
   input: { appName?: string; logoUrl?: string }
 ): Promise<AppBrandingSettings> {
+  const snapshot = await readModuleSheet(env, APP_SETTINGS_SHEET_NAME, APP_SETTINGS_HEADERS);
+
   if ("appName" in input) {
-    await upsertAppSetting(env, "appName", stringValue(input.appName));
+    await upsertAppSettingWithSnapshot(env, snapshot, "appName", stringValue(input.appName));
   }
 
   if ("logoUrl" in input) {
-    await upsertAppSetting(env, "logoUrl", stringValue(input.logoUrl));
+    await upsertAppSettingWithSnapshot(env, snapshot, "logoUrl", stringValue(input.logoUrl));
   }
 
-  return getBrandingSettings(env);
+  const nextMap = snapshot.rows
+    .filter((row) => row.some((cell) => normalizeCell(cell) !== ""))
+    .map((row) => rowToAppSetting(snapshot.headers, row))
+    .reduce<Record<string, string>>((acc, item) => {
+      acc[item.settingKey] = item.settingValue;
+      return acc;
+    }, {});
+
+  if ("appName" in input) {
+    nextMap.appName = stringValue(input.appName);
+  }
+
+  if ("logoUrl" in input) {
+    nextMap.logoUrl = stringValue(input.logoUrl);
+  }
+
+  return {
+    appName: nextMap.appName || "FinanzasHogar",
+    logoUrl: nextMap.logoUrl || ""
+  };
 }
 
 async function listAppSettings(env: Env): Promise<AppSettingsRecord[]> {
@@ -1640,6 +1675,15 @@ async function listAppSettings(env: Env): Promise<AppSettingsRecord[]> {
 
 async function upsertAppSetting(env: Env, settingKey: string, settingValue: string): Promise<void> {
   const snapshot = await readModuleSheet(env, APP_SETTINGS_SHEET_NAME, APP_SETTINGS_HEADERS);
+  await upsertAppSettingWithSnapshot(env, snapshot, settingKey, settingValue);
+}
+
+async function upsertAppSettingWithSnapshot(
+  env: Env,
+  snapshot: SheetSnapshot,
+  settingKey: string,
+  settingValue: string
+): Promise<void> {
   const match = findRowByKey(snapshot, "settingKey", settingKey);
   const record: AppSettingsRecord = {
     settingKey,
@@ -1814,41 +1858,119 @@ async function getCardById(env: Env, cardId: string): Promise<CardRecord | null>
   return cards.find((card) => card.cardId === cardId) ?? null;
 }
 
-async function ensureModuleSheet(env: Env, config: ModuleSheetConfig): Promise<ModuleSheetSetupStatus> {
-  const existingSheets = await getSpreadsheetSheets(env);
-  const existingSheet = existingSheets.find((sheet) => sheet.title === config.sheetName);
-  let created = false;
-  let addedHeaders: string[] = [];
+function sheetCacheKey(env: Env, sheetName: string): string {
+  return `${getSanitizedSpreadsheetId(env)}::${sheetName}`;
+}
 
-  if (!existingSheet) {
-    await addSheet(env, config.sheetName);
-    created = true;
+function spreadsheetCacheKey(env: Env): string {
+  return getSanitizedSpreadsheetId(env);
+}
+
+function cloneSheetSnapshot(snapshot: SheetSnapshot): SheetSnapshot {
+  return {
+    headers: [...snapshot.headers],
+    rows: snapshot.rows.map((row) => [...row])
+  };
+}
+
+function readCacheEntryValue<T>(cache: Map<string, CacheEntry<T>>, key: string): T | null {
+  const entry = cache.get(key);
+
+  if (!entry) {
+    return null;
   }
 
-  const currentHeaders = await readHeaders(env, config.sheetName);
+  if (entry.value && entry.expiresAt > Date.now()) {
+    return entry.value;
+  }
 
-  if (currentHeaders.length === 0) {
-    await writeHeaders(env, config.sheetName, config.headers);
+  if (!entry.promise) {
+    cache.delete(key);
+  }
+
+  return null;
+}
+
+async function resolveCached<T>(
+  cache: Map<string, CacheEntry<T>>,
+  key: string,
+  ttlMs: number,
+  loader: () => Promise<T>
+): Promise<T> {
+  const existing = cache.get(key);
+  const now = Date.now();
+
+  if (existing?.value && existing.expiresAt > now) {
+    return existing.value;
+  }
+
+  if (existing?.promise) {
+    return existing.promise;
+  }
+
+  const pending = loader()
+    .then((value) => {
+      cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+      return value;
+    })
+    .catch((error) => {
+      cache.delete(key);
+      throw error;
+    });
+
+  cache.set(key, { promise: pending, expiresAt: now + ttlMs });
+  return pending;
+}
+
+function invalidateSheetCaches(env: Env, sheetName: string): void {
+  const key = sheetCacheKey(env, sheetName);
+  moduleSetupCache.delete(key);
+  sheetSnapshotCache.delete(key);
+}
+
+function invalidateSpreadsheetSheetList(env: Env): void {
+  spreadsheetSheetsCache.delete(spreadsheetCacheKey(env));
+}
+
+async function ensureModuleSheet(env: Env, config: ModuleSheetConfig): Promise<ModuleSheetSetupStatus> {
+  const key = sheetCacheKey(env, config.sheetName);
+
+  return resolveCached(moduleSetupCache, key, MODULE_SETUP_CACHE_TTL_MS, async () => {
+    const existingSheets = await getSpreadsheetSheets(env);
+    const existingSheet = existingSheets.find((sheet) => sheet.title === config.sheetName);
+    let created = false;
+    let addedHeaders: string[] = [];
+
+    if (!existingSheet) {
+      await addSheet(env, config.sheetName);
+      created = true;
+    }
+
+    const currentHeaders = await readHeaders(env, config.sheetName);
+
+    if (currentHeaders.length === 0) {
+      await writeHeaders(env, config.sheetName, config.headers);
+      return {
+        sheetName: config.sheetName,
+        created,
+        addedHeaders: [...config.headers],
+        headers: [...config.headers]
+      };
+    }
+
+    const missingHeaders = config.headers.filter((header) => !currentHeaders.includes(header));
+    if (missingHeaders.length > 0) {
+      await appendHeaders(env, config.sheetName, currentHeaders.length + 1, missingHeaders);
+      addedHeaders = [...missingHeaders];
+    }
+
     return {
       sheetName: config.sheetName,
       created,
-      addedHeaders: [...config.headers],
-      headers: [...config.headers]
+      addedHeaders,
+      headers: [...currentHeaders, ...addedHeaders]
     };
-  }
-
-  const missingHeaders = config.headers.filter((header) => !currentHeaders.includes(header));
-  if (missingHeaders.length > 0) {
-    await appendHeaders(env, config.sheetName, currentHeaders.length + 1, missingHeaders);
-    addedHeaders = [...missingHeaders];
-  }
-
-  return {
-    sheetName: config.sheetName,
-    created,
-    addedHeaders,
-    headers: [...currentHeaders, ...addedHeaders]
-  };
+  });
 }
 
 async function readModuleSheet(
@@ -1856,20 +1978,34 @@ async function readModuleSheet(
   sheetName: string,
   headers: readonly string[]
 ): Promise<SheetSnapshot> {
-  await ensureModuleSheet(env, { sheetName, headers });
-  const response = await sheetsRequest(
-    env,
-    `/values/${encodeURIComponent(`${sheetName}${DEFAULT_SHEET_RANGE_SUFFIX}`)}?majorDimension=ROWS`,
-    "sheet-read"
-  );
-  const data = (await response.json()) as GoogleValuesResponse;
-  const values = data.values ?? [];
-  const detectedHeaders = values[0]?.map((header) => normalizeCell(header)).filter(Boolean) ?? [...headers];
+  const cached = readCacheEntryValue(sheetSnapshotCache, sheetCacheKey(env, sheetName));
+  if (cached) {
+    return cloneSheetSnapshot(cached);
+  }
 
-  return {
-    headers: detectedHeaders,
-    rows: values.slice(1)
-  };
+  const snapshot = await resolveCached(
+    sheetSnapshotCache,
+    sheetCacheKey(env, sheetName),
+    SHEET_SNAPSHOT_CACHE_TTL_MS,
+    async () => {
+      await ensureModuleSheet(env, { sheetName, headers });
+      const response = await sheetsRequest(
+        env,
+        `/values/${encodeURIComponent(`${sheetName}${DEFAULT_SHEET_RANGE_SUFFIX}`)}?majorDimension=ROWS`,
+        "sheet-read"
+      );
+      const data = (await response.json()) as GoogleValuesResponse;
+      const values = data.values ?? [];
+      const detectedHeaders = values[0]?.map((header) => normalizeCell(header)).filter(Boolean) ?? [...headers];
+
+      return {
+        headers: detectedHeaders,
+        rows: values.slice(1)
+      };
+    }
+  );
+
+  return cloneSheetSnapshot(snapshot);
 }
 
 async function appendRow(
@@ -1903,6 +2039,8 @@ async function appendRows(
       })
     }
   );
+
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function updateRow(
@@ -1927,6 +2065,8 @@ async function updateRow(
       })
     }
   );
+
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function deleteSheetRow(env: Env, sheetName: string, rowIndex: number): Promise<void> {
@@ -1950,22 +2090,31 @@ async function deleteSheetRow(env: Env, sheetName: string, rowIndex: number): Pr
       ]
     })
   });
+
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function getSpreadsheetSheets(env: Env): Promise<Array<{ sheetId: number; title: string }>> {
-  const response = await sheetsRequest(
-    env,
-    `?fields=${encodeURIComponent("sheets(properties(sheetId,title))")}`,
-    "sheet-read"
-  );
-  const data = (await response.json()) as GoogleSpreadsheetResponse;
+  return resolveCached(
+    spreadsheetSheetsCache,
+    spreadsheetCacheKey(env),
+    SPREADSHEET_SHEETS_CACHE_TTL_MS,
+    async () => {
+      const response = await sheetsRequest(
+        env,
+        `?fields=${encodeURIComponent("sheets(properties(sheetId,title))")}`,
+        "sheet-read"
+      );
+      const data = (await response.json()) as GoogleSpreadsheetResponse;
 
-  return (data.sheets ?? [])
-    .map((sheet) => ({
-      sheetId: sheet.properties?.sheetId ?? -1,
-      title: sheet.properties?.title ?? ""
-    }))
-    .filter((sheet) => sheet.sheetId >= 0 && sheet.title);
+      return (data.sheets ?? [])
+        .map((sheet) => ({
+          sheetId: sheet.properties?.sheetId ?? -1,
+          title: sheet.properties?.title ?? ""
+        }))
+        .filter((sheet) => sheet.sheetId >= 0 && sheet.title);
+    }
+  );
 }
 
 async function getSheetIdByName(env: Env, sheetName: string): Promise<number> {
@@ -1997,6 +2146,9 @@ async function addSheet(env: Env, sheetName: string): Promise<void> {
       ]
     })
   });
+
+  invalidateSpreadsheetSheetList(env);
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function readHeaders(env: Env, sheetName: string): Promise<string[]> {
@@ -2015,6 +2167,8 @@ async function writeHeaders(env: Env, sheetName: string, headers: readonly strin
       values: [headers]
     })
   });
+
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function appendHeaders(
@@ -2034,6 +2188,8 @@ async function appendHeaders(
       values: [headers]
     })
   });
+
+  invalidateSheetCaches(env, sheetName);
 }
 
 async function sheetsRequest(
@@ -2057,6 +2213,15 @@ async function sheetsRequest(
 
   if (!response.ok) {
     const body = await response.text();
+    if (response.status === 429) {
+      throw new AppError(
+        step,
+        "Google Sheets alcanzó un límite temporal de lecturas. Esperá unos segundos y probá de nuevo.",
+        `status=${response.status} body=${body}`,
+        429
+      );
+    }
+
     throw new AppError(step, "Google Sheets module request failed.", `status=${response.status} body=${body}`);
   }
 
@@ -2064,7 +2229,7 @@ async function sheetsRequest(
 }
 
 async function fetchSheetsWithRetry(url: string, init: RequestInit): Promise<Response> {
-  const maxAttempts = 3;
+  const maxAttempts = 4;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const response = await fetch(url, init);
@@ -2073,8 +2238,10 @@ async function fetchSheetsWithRetry(url: string, init: RequestInit): Promise<Res
       return response;
     }
 
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterMilliseconds = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 0;
     response.body?.cancel().catch(() => undefined);
-    await sleep(250 * attempt);
+    await sleep(Math.max(retryAfterMilliseconds, 600 * attempt));
   }
 
   return fetch(url, init);

@@ -216,7 +216,7 @@ app.get("/api/transactions", async (c) => {
         error: appError.message,
         details: appError.details ?? null
       },
-      { status: appError.status as 500 }
+      { status: appError.status as 400 | 404 | 429 | 500 }
     );
   }
 });
@@ -303,7 +303,7 @@ app.get("/debug/sheets", async (c) => {
         error: appError.message,
         details: appError.details ?? null
       },
-      { status: appError.status as 500 }
+      { status: appError.status as 400 | 404 | 429 | 500 }
     );
   }
 });
@@ -1010,7 +1010,7 @@ app.onError((error, c) => {
       error: appError.message,
       details: appError.details ?? null
     },
-    { status: appError.status as 500 }
+    { status: appError.status as 400 | 404 | 429 | 500 }
   );
 });
 
@@ -1458,9 +1458,21 @@ function buildUploadErrorResponse(error: unknown, fallbackStage: AppErrorStep) {
   };
 }
 
-function getErrorStatus(error: unknown): 400 | 404 | 500 {
+function getErrorStatus(error: unknown): 400 | 404 | 429 | 500 {
   if (error instanceof AppError) {
-    return error.status === 404 ? 404 : error.status === 400 ? 400 : 500;
+    if (error.status === 404) {
+      return 404;
+    }
+
+    if (error.status === 400) {
+      return 400;
+    }
+
+    if (error.status === 429) {
+      return 429;
+    }
+
+    return 500;
   }
 
   return 500;
